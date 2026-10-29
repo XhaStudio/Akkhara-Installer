@@ -14,7 +14,7 @@ const REPO: &str = "XhaStudio/Akkhara-Programming-Language";
 
 enum Msg {
     Log(String),
-    Done(bool),
+    Done,
 }
 
 // ---------------------------------------------------------------- platform
@@ -285,11 +285,11 @@ impl InstallerApp {
             };
             match result {
                 Ok(()) => {
-                    let _ = tx.send(Msg::Done(true));
+                    let _ = tx.send(Msg::Done);
                 }
                 Err(e) => {
                     let _ = tx.send(Msg::Log(format!("Error: {e}")));
-                    let _ = tx.send(Msg::Done(false));
+                    let _ = tx.send(Msg::Done);
                 }
             }
         });
@@ -302,7 +302,7 @@ impl eframe::App for InstallerApp {
             while let Ok(m) = rx.try_recv() {
                 match m {
                     Msg::Log(s) => self.log.push(s),
-                    Msg::Done(_) => self.busy = false,
+                    Msg::Done => self.busy = false,
                 }
             }
         }
