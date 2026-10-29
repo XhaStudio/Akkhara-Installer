@@ -1,0 +1,47 @@
+# Put this file in the Akkhara repo at .github/workflows/release.yml
+# (merge with your existing workflow if needed) and keep this installer
+# project in the repo's `installer/` folder.
+# Push a tag like v1.0.0 to build and publish everything.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,  suffix: windows-x86_64.exe, ext: .exe }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, suffix: linux-x86_64,       ext: '' }
+          - { os: macos-latest,   target: aarch64-apple-darwin,     suffix: macos-aarch64,      ext: '' }
+          - { os: macos-latest,   target: x86_64-apple-darwin,      suffix: macos-x86_64,       ext: '' }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build akk
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build installer
+        run: cargo build --release --target ${{ matrix.target }} --manifest-path installer/Cargo.toml
+
+      - name: Stage assets
+        shell: bash
+        run: |
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/akk${{ matrix.ext }}" "dist/akk-${{ matrix.suffix }}"
+          cp "installer/target/${{ matrix.target }}/release/akkhara-installer${{ matrix.ext }}" "dist/Akkhara-Installer-${{ matrix.suffix }}"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
