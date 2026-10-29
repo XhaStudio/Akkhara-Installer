@@ -450,7 +450,7 @@ fn draw_logo(p: &egui::Painter, logo: &Tex, r: Rect) {
         Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
         Color32::WHITE,
     );
-    p.rect_stroke(r.shrink(4.0), 26.0, Stroke::new(8.0, BLUE));
+    p.rect_stroke(r.shrink(4.0), 26.0, Stroke::new(8.0_f32, BLUE));
 }
 
 fn big_button(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, label: &str) -> bool {
@@ -535,8 +535,8 @@ impl eframe::App for InstallerApp {
                 let cr = ui.interact(cx, ui.id().with("close"), Sense::click());
                 let col = if cr.hovered() { BLUE } else { INK };
                 let c = cx.center();
-                p.line_segment([c + vec2(-6.0, -6.0), c + vec2(6.0, 6.0)], Stroke::new(3.0, col));
-                p.line_segment([c + vec2(-6.0, 6.0), c + vec2(6.0, -6.0)], Stroke::new(3.0, col));
+                p.line_segment([c + vec2(-6.0, -6.0), c + vec2(6.0, 6.0)], Stroke::new(3.0_f32, col));
+                p.line_segment([c + vec2(-6.0, 6.0), c + vec2(6.0, -6.0)], Stroke::new(3.0_f32, col));
                 if cr.hovered() {
                     ctx.set_cursor_icon(CursorIcon::PointingHand);
                 }
@@ -554,7 +554,7 @@ impl eframe::App for InstallerApp {
                         p.rect_filled(field.shrink(2.0), 14.0, LIGHT);
                         p.extend(egui::Shape::dashed_line(
                             &rounded_path(field.shrink(2.0), 14.0),
-                            Stroke::new(3.0, INK),
+                            Stroke::new(3.0_f32, INK),
                             9.0,
                             6.0,
                         ));
@@ -575,7 +575,7 @@ impl eframe::App for InstallerApp {
                             self.add_path = !self.add_path;
                         }
                         let center = o + vec2(218.0, 168.0);
-                        p.circle(center, 11.0, Color32::TRANSPARENT, Stroke::new(3.0, INK));
+                        p.circle(center, 11.0, Color32::TRANSPARENT, Stroke::new(3.0_f32, INK));
                         if self.add_path {
                             p.circle_filled(center, 6.0, BLUE);
                         }
