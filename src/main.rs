@@ -20,13 +20,13 @@ enum Msg {
 // ---------------------------------------------------------------- platform
 
 /// Name of the release asset to download for this OS/CPU.
-/// Must match the names produced by .github/workflows/release.yml.
+/// Must match the asset names on the main repo's GitHub Releases.
 fn asset_name() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", "x86_64") => Some("akk-windows-x86_64.exe"),
-        ("linux", "x86_64") => Some("akk-linux-x86_64"),
-        ("macos", "aarch64") => Some("akk-macos-aarch64"),
-        ("macos", "x86_64") => Some("akk-macos-x86_64"),
+        ("windows", "x86_64") => Some("akk-x86_64-pc-windows-msvc.zip"),
+        ("linux", "x86_64") => Some("akk-x86_64-unknown-linux-gnu.tar.gz"),
+        ("macos", "aarch64") => Some("akk-aarch64-apple-darwin.tar.gz"),
+        ("macos", "x86_64") => Some("akk-x86_64-apple-darwin.tar.gz"),
         _ => None,
     }
 }
@@ -157,6 +157,43 @@ fn remove_from_path(_dir: &Path) -> Result<(), String> {
 
 // ----------------------------------------------------------------- install
 
+/// Pull the `akk` executable out of a downloaded .zip / .tar.gz (any folder depth).
+fn extract_binary(asset: &str, data: &[u8]) -> Result<Vec<u8>, String> {
+    let want = bin_name();
+    if asset.ends_with(".zip") {
+        let mut ar = zip::ZipArchive::new(std::io::Cursor::new(data))
+            .map_err(|e| format!("Bad zip file: {e}"))?;
+        for i in 0..ar.len() {
+            let mut f = ar.by_index(i).map_err(|e| e.to_string())?;
+            let is_match = f.is_file()
+                && Path::new(f.name()).file_name().and_then(|n| n.to_str()) == Some(want);
+            if is_match {
+                let mut out = Vec::new();
+                f.read_to_end(&mut out).map_err(|e| e.to_string())?;
+                return Ok(out);
+            }
+        }
+    } else if asset.ends_with(".tar.gz") {
+        let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(data));
+        for entry in ar.entries().map_err(|e| e.to_string())? {
+            let mut entry = entry.map_err(|e| e.to_string())?;
+            let is_match = entry
+                .path()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n == want))
+                .unwrap_or(false);
+            if is_match {
+                let mut out = Vec::new();
+                entry.read_to_end(&mut out).map_err(|e| e.to_string())?;
+                return Ok(out);
+            }
+        }
+    } else {
+        return Ok(data.to_vec());
+    }
+    Err(format!("`{want}` was not found inside {asset}"))
+}
+
 fn install(dir: PathBuf, add_path: bool, tx: &Sender<Msg>) -> Result<(), String> {
     let log = |s: &str| {
         let _ = tx.send(Msg::Log(s.to_string()));
@@ -196,10 +233,13 @@ fn install(dir: PathBuf, add_path: bool, tx: &Sender<Msg>) -> Result<(), String>
         return Err("Downloaded file looks too small; aborting.".into());
     }
 
+    log("Unpacking...");
+    let exe = extract_binary(asset, &buf)?;
+
     fs::create_dir_all(&dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
     let target = dir.join(bin_name());
     let tmp = dir.join(format!("{}.new", bin_name()));
-    fs::write(&tmp, &buf).map_err(|e| format!("Could not write file: {e}"))?;
+    fs::write(&tmp, &exe).map_err(|e| format!("Could not write file: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -308,7 +348,7 @@ impl eframe::App for InstallerApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Akkhara (အက္ခရာ) Installer");
+            ui.heading("Akkhara Installer");
             ui.label("Installs the `akk` interpreter for your user account. No admin rights needed.");
             ui.add_space(10.0);
 
