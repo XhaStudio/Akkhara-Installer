@@ -7,11 +7,14 @@ downloads the right `akk` binary for the OS/CPU, installs it per-user
 (Windows: `%LOCALAPPDATA%\Akkhara\bin`, Mac/Linux: `~/.akkhara/bin`), and adds it to PATH.
 It also has an Uninstall button.
 
-## Setup
-1. Copy this folder into the Akkhara repo as `installer/`.
-2. Put `.github/workflows/release.yml` into the repo's `.github/workflows/`.
-3. Tag a release: `git tag v1.0.0 && git push origin v1.0.0`.
-4. Releases will contain `akk-<platform>` binaries and `Akkhara-Installer-<platform>` installers.
+## Setup (two repos)
+**Installer repo** (this folder, e.g. XhaStudio/Akkhara-Installer): the repo root must contain
+`Cargo.toml`, `src/main.rs`, `LICENSE`, `.gitignore` and `.github/workflows/release.yml`.
+Tag a release (`git tag v0.1.0 && git push origin v0.1.0`) to publish `Akkhara-Installer-<platform>`.
+
+**Main repo** (XhaStudio/Akkhara-Programming-Language): add `akk-release.yml` as
+`.github/workflows/release.yml` and tag a release. It publishes the `akk-<platform>` binaries
+that the installer downloads.
 
 ## Local test
     cd installer && cargo run --release
