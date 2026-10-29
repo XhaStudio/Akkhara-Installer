@@ -1,0 +1,20 @@
+[package]
+name = "akkhara-installer"
+version = "0.1.0"
+edition = "2021"
+description = "GUI installer for the Akkhara programming language (akk)"
+
+[dependencies]
+eframe = "0.29"
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
