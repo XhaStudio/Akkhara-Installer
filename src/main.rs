@@ -686,14 +686,31 @@ impl eframe::App for InstallerApp {
     }
 }
 
+// Window / taskbar icon. Put your icon at `favicon.png` in the repo root (square PNG, e.g. 256x256).
+const FAVICON_PNG: &[u8] = include_bytes!("../favicon.png");
+
+fn window_icon() -> Option<egui::IconData> {
+    let img = image::load_from_memory(FAVICON_PNG).ok()?.to_rgba8();
+    let (width, height) = img.dimensions();
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    })
+}
+
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Akkhara Installer")
+        .with_inner_size([WIN_W, WIN_H])
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_resizable(false);
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Akkhara Installer")
-            .with_inner_size([WIN_W, WIN_H])
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_resizable(false),
+        viewport,
         centered: true,
         ..Default::default()
     };
