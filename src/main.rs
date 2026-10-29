@@ -1,20 +1,22 @@
 // Hide the console window on Windows release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use eframe::egui;
+use eframe::egui::{self, pos2, vec2, Align, Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke};
 use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
     sync::mpsc::{channel, Receiver, Sender},
     thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const REPO: &str = "XhaStudio/Akkhara-Programming-Language";
 
 enum Msg {
-    Log(String),
+    Progress(f32),
     Done,
+    Fail(String),
 }
 
 // ---------------------------------------------------------------- platform
@@ -195,13 +197,13 @@ fn extract_binary(asset: &str, data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn install(dir: PathBuf, add_path: bool, tx: &Sender<Msg>) -> Result<(), String> {
-    let log = |s: &str| {
-        let _ = tx.send(Msg::Log(s.to_string()));
+    let prog = |v: f32| {
+        let _ = tx.send(Msg::Progress(v));
     };
 
     let asset = asset_name().ok_or("This platform is not supported yet.")?;
+    prog(0.03);
 
-    log("Looking up the latest release...");
     let release: serde_json::Value =
         ureq::get(&format!("https://api.github.com/repos/{REPO}/releases/latest"))
             .set("User-Agent", "akkhara-installer")
@@ -210,6 +212,7 @@ fn install(dir: PathBuf, add_path: bool, tx: &Sender<Msg>) -> Result<(), String>
             .map_err(|e| format!("Could not reach GitHub (is there a published release?): {e}"))?
             .into_json()
             .map_err(|e| e.to_string())?;
+    prog(0.08);
 
     let tag = release["tag_name"].as_str().unwrap_or("unknown").to_string();
     let url = release["assets"]
@@ -219,22 +222,33 @@ fn install(dir: PathBuf, add_path: bool, tx: &Sender<Msg>) -> Result<(), String>
         .ok_or_else(|| format!("Release {tag} has no asset named {asset}"))?
         .to_string();
 
-    log(&format!("Downloading akk {tag} ({asset})..."));
-    let mut buf = Vec::new();
-    ureq::get(&url)
+    let resp = ureq::get(&url)
         .set("User-Agent", "akkhara-installer")
         .call()
-        .map_err(|e| format!("Download failed: {e}"))?
-        .into_reader()
-        .take(300_000_000)
-        .read_to_end(&mut buf)
         .map_err(|e| format!("Download failed: {e}"))?;
+    let total: Option<u64> = resp.header("Content-Length").and_then(|v| v.parse().ok());
+    let mut reader = resp.into_reader().take(300_000_000);
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 32 * 1024];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|e| format!("Download failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(t) = total.filter(|t| *t > 0) {
+            prog(0.08 + 0.72 * (buf.len() as f32 / t as f32).min(1.0));
+        }
+    }
     if buf.len() < 1024 {
         return Err("Downloaded file looks too small; aborting.".into());
     }
+    prog(0.82);
 
-    log("Unpacking...");
     let exe = extract_binary(asset, &buf)?;
+    prog(0.88);
 
     fs::create_dir_all(&dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
     let target = dir.join(bin_name());
@@ -248,34 +262,28 @@ fn install(dir: PathBuf, add_path: bool, tx: &Sender<Msg>) -> Result<(), String>
     fs::rename(&tmp, &target).map_err(|e| {
         format!("Could not replace {} (is akk running?): {e}", target.display())
     })?;
-    log(&format!("Installed to {}", target.display()));
+    prog(0.94);
 
     if add_path {
-        match add_to_path(&dir)? {
-            true => log("Added to PATH. Open a NEW terminal to use `akk`."),
-            false => log("Already on PATH."),
-        }
-    } else {
-        log("Skipped PATH setup.");
+        add_to_path(&dir)?;
     }
-    log("Done! Try: akk myprogram.akk");
+    prog(1.0);
     Ok(())
 }
 
 fn uninstall(dir: PathBuf, tx: &Sender<Msg>) -> Result<(), String> {
-    let log = |s: &str| {
-        let _ = tx.send(Msg::Log(s.to_string()));
+    let prog = |v: f32| {
+        let _ = tx.send(Msg::Progress(v));
     };
+    prog(0.1);
     let target = dir.join(bin_name());
     if target.exists() {
         fs::remove_file(&target)
             .map_err(|e| format!("Could not remove {}: {e}", target.display()))?;
-        log(&format!("Removed {}", target.display()));
-    } else {
-        log("akk was not found in that folder.");
     }
+    prog(0.5);
     remove_from_path(&dir)?;
-    log("Removed PATH entry.");
+    prog(0.8);
     let _ = fs::remove_dir(&dir);
     if let Some(parent) = dir.parent() {
         let name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -283,38 +291,117 @@ fn uninstall(dir: PathBuf, tx: &Sender<Msg>) -> Result<(), String> {
             let _ = fs::remove_dir(parent); // only succeeds if empty
         }
     }
-    log("Uninstalled.");
+    prog(1.0);
     Ok(())
 }
 
 // ---------------------------------------------------------------------- UI
 
-struct InstallerApp {
-    dir: String,
-    add_path: bool,
-    log: Vec<String>,
-    busy: bool,
-    rx: Option<Receiver<Msg>>,
+const CARD: Color32 = Color32::from_rgb(118, 169, 199);
+const LIGHT: Color32 = Color32::from_rgb(184, 229, 255);
+const BLUE: Color32 = Color32::from_rgb(29, 91, 194);
+const INK: Color32 = Color32::BLACK;
+
+const WIN_W: f32 = 660.0;
+const WIN_H: f32 = 280.0;
+
+const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
+// Pre-rendered with proper Myanmar text shaping (egui cannot shape Burmese itself).
+const MESSAGE_PNGS: [&[u8]; 4] = [
+    include_bytes!("../assets/msg1.png"),
+    include_bytes!("../assets/msg2.png"),
+    include_bytes!("../assets/msg3.png"),
+    include_bytes!("../assets/msg4.png"),
+];
+
+struct Tex {
+    handle: egui::TextureHandle,
+    size: egui::Vec2,
 }
 
-impl Default for InstallerApp {
-    fn default() -> Self {
-        Self {
-            dir: default_dir().to_string_lossy().to_string(),
-            add_path: true,
-            log: vec!["Ready.".into()],
-            busy: false,
-            rx: None,
-        }
+fn load_tex(ctx: &egui::Context, name: &str, bytes: &[u8], scale: f32) -> Tex {
+    let img = image::load_from_memory(bytes)
+        .expect("bad embedded image")
+        .to_rgba8();
+    let (w, h) = img.dimensions();
+    let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+    Tex {
+        handle: ctx.load_texture(name, ci, egui::TextureOptions::LINEAR),
+        size: vec2(w as f32 / scale, h as f32 / scale),
     }
 }
 
+fn next_index(cur: usize, n: usize) -> usize {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0) as usize;
+    let mut i = nanos % n;
+    if i == cur {
+        i = (i + 1) % n;
+    }
+    i
+}
+
+#[derive(Clone)]
+enum Page {
+    Setup,
+    Working,
+    Finished,
+    Failed(String),
+}
+
+struct InstallerApp {
+    page: Page,
+    dir: String,
+    add_path: bool,
+    uninstalling: bool,
+    rx: Option<Receiver<Msg>>,
+    target: f32,
+    shown: f32,
+    done: bool,
+    started: Instant,
+    msg_idx: usize,
+    msg_at: Instant,
+    logo: Tex,
+    msgs: Vec<Tex>,
+}
+
 impl InstallerApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let ctx = &cc.egui_ctx;
+        Self {
+            page: Page::Setup,
+            dir: default_dir().to_string_lossy().to_string(),
+            add_path: true,
+            uninstalling: false,
+            rx: None,
+            target: 0.0,
+            shown: 0.0,
+            done: false,
+            started: Instant::now(),
+            msg_idx: next_index(usize::MAX, MESSAGE_PNGS.len()),
+            msg_at: Instant::now(),
+            logo: load_tex(ctx, "logo", LOGO_PNG, 1.0),
+            msgs: MESSAGE_PNGS
+                .iter()
+                .enumerate()
+                .map(|(i, b)| load_tex(ctx, &format!("msg{i}"), b, 2.0))
+                .collect(),
+        }
+    }
+
     fn start(&mut self, remove: bool) {
         let (tx, rx) = channel();
         self.rx = Some(rx);
-        self.busy = true;
-        self.log.clear();
+        self.uninstalling = remove;
+        self.page = Page::Working;
+        self.target = 0.0;
+        self.shown = 0.0;
+        self.done = false;
+        self.started = Instant::now();
+        self.msg_at = Instant::now();
+        self.msg_idx = next_index(usize::MAX, self.msgs.len());
         let dir = PathBuf::from(self.dir.trim());
         let add_path = self.add_path;
         thread::spawn(move || {
@@ -323,79 +410,296 @@ impl InstallerApp {
             } else {
                 install(dir, add_path, &tx)
             };
-            match result {
-                Ok(()) => {
-                    let _ = tx.send(Msg::Done);
-                }
-                Err(e) => {
-                    let _ = tx.send(Msg::Log(format!("Error: {e}")));
-                    let _ = tx.send(Msg::Done);
-                }
-            }
+            let _ = match result {
+                Ok(()) => tx.send(Msg::Done),
+                Err(e) => tx.send(Msg::Fail(e)),
+            };
         });
     }
 }
 
+// ---- drawing helpers
+
+fn thick_box(p: &egui::Painter, r: Rect, radius: f32, fill: Color32, w: f32) {
+    p.rect(r.shrink(w / 2.0), radius, fill, Stroke::new(w, INK));
+}
+
+fn rounded_path(r: Rect, rad: f32) -> Vec<Pos2> {
+    let corners = [
+        (r.right_top() + vec2(-rad, rad), -90.0_f32),
+        (r.right_bottom() + vec2(-rad, -rad), 0.0),
+        (r.left_bottom() + vec2(rad, -rad), 90.0),
+        (r.left_top() + vec2(rad, rad), 180.0),
+    ];
+    let mut pts = Vec::new();
+    for (c, start) in corners {
+        for i in 0..=8 {
+            let a = (start + i as f32 * 90.0 / 8.0).to_radians();
+            pts.push(c + vec2(a.cos(), a.sin()) * rad);
+        }
+    }
+    pts.push(pts[0]);
+    pts
+}
+
+fn draw_logo(p: &egui::Painter, logo: &Tex, r: Rect) {
+    p.rect_filled(r, 26.0, LIGHT);
+    p.image(
+        logo.handle.id(),
+        r.shrink(10.0),
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
+    p.rect_stroke(r.shrink(4.0), 26.0, Stroke::new(8.0, BLUE));
+}
+
+fn big_button(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, label: &str) -> bool {
+    let resp = ui.interact(r, ui.id().with(label), Sense::click());
+    let fill = if resp.is_pointer_button_down_on() {
+        Color32::from_rgb(146, 208, 244)
+    } else if resp.hovered() {
+        Color32::from_rgb(204, 238, 255)
+    } else {
+        LIGHT
+    };
+    thick_box(p, r, 24.0, fill, 6.0);
+    p.text(r.center(), Align2::CENTER_CENTER, label, FontId::monospace(20.0), INK);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    resp.clicked()
+}
+
+fn heading(p: &egui::Painter, origin: Pos2, text: &str) {
+    p.text(
+        origin + vec2(207.0, 0.0),
+        Align2::LEFT_CENTER,
+        text,
+        FontId::monospace(22.0),
+        INK,
+    );
+}
+
 impl eframe::App for InstallerApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ---- messages from the worker thread
         if let Some(rx) = &self.rx {
             while let Ok(m) = rx.try_recv() {
                 match m {
-                    Msg::Log(s) => self.log.push(s),
-                    Msg::Done => self.busy = false,
+                    Msg::Progress(v) => self.target = self.target.max(v),
+                    Msg::Done => {
+                        self.target = 1.0;
+                        self.done = true;
+                    }
+                    Msg::Fail(e) => self.page = Page::Failed(e),
                 }
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Akkhara Installer");
-            ui.label("Installs the `akk` interpreter for your user account. No admin rights needed.");
-            ui.add_space(10.0);
-
-            ui.label("Install folder");
-            ui.add_enabled(!self.busy, egui::TextEdit::singleline(&mut self.dir).desired_width(f32::INFINITY));
-            ui.add_enabled(
-                !self.busy,
-                egui::Checkbox::new(&mut self.add_path, "Add akk to PATH"),
-            );
-            ui.add_space(8.0);
-
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!self.busy, egui::Button::new("Install / Update")).clicked() {
-                    self.start(false);
-                }
-                if ui.add_enabled(!self.busy, egui::Button::new("Uninstall")).clicked() {
-                    self.start(true);
-                }
-                if self.busy {
-                    ui.spinner();
-                }
-            });
-            ui.add_space(8.0);
-
-            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                for line in &self.log {
-                    ui.monospace(line);
-                }
-            });
-        });
-
-        if self.busy {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        // ---- animation
+        if matches!(self.page, Page::Working) {
+            self.shown += (self.target - self.shown) * 0.12;
+            if self.done && self.shown >= 0.995 {
+                self.shown = 1.0;
+                self.page = Page::Finished;
+            }
+            if self.msg_at.elapsed() >= Duration::from_secs(3) {
+                self.msg_idx = next_index(self.msg_idx, self.msgs.len());
+                self.msg_at = Instant::now();
+            }
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none())
+            .show(ctx, |ui| {
+                let full = ui.max_rect();
+                let o = full.min; // origin: design coordinates are relative to the card
+                let p = ui.painter().clone();
+
+                // drag the frameless window by its background
+                let drag = ui.interact(full, ui.id().with("drag"), Sense::drag());
+                if drag.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+
+                // card
+                thick_box(&p, full.shrink(0.0), 26.0, CARD, 8.0);
+
+                // close (x) button
+                let cx = Rect::from_center_size(pos2(full.max.x - 30.0, o.y + 30.0), vec2(24.0, 24.0));
+                let cr = ui.interact(cx, ui.id().with("close"), Sense::click());
+                let col = if cr.hovered() { BLUE } else { INK };
+                let c = cx.center();
+                p.line_segment([c + vec2(-6.0, -6.0), c + vec2(6.0, 6.0)], Stroke::new(3.0, col));
+                p.line_segment([c + vec2(-6.0, 6.0), c + vec2(6.0, -6.0)], Stroke::new(3.0, col));
+                if cr.hovered() {
+                    ctx.set_cursor_icon(CursorIcon::PointingHand);
+                }
+                if cr.clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+
+                match self.page.clone() {
+                    // ------------------------------------------------ setup (screenshot 1)
+                    Page::Setup => {
+                        draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(22.0, 20.0), vec2(167.0, 167.0)));
+                        p.text(o + vec2(206.0, 62.0), Align2::LEFT_CENTER, "Install folder", FontId::monospace(20.0), INK);
+
+                        let field = Rect::from_min_size(o + vec2(205.0, 88.0), vec2(411.0, 42.0));
+                        p.rect_filled(field.shrink(2.0), 14.0, LIGHT);
+                        p.extend(egui::Shape::dashed_line(
+                            &rounded_path(field.shrink(2.0), 14.0),
+                            Stroke::new(3.0, INK),
+                            9.0,
+                            6.0,
+                        ));
+                        ui.put(
+                            field.shrink2(vec2(14.0, 4.0)),
+                            egui::TextEdit::singleline(&mut self.dir)
+                                .frame(false)
+                                .font(FontId::monospace(14.0))
+                                .text_color(INK)
+                                .vertical_align(Align::Center)
+                                .desired_width(f32::INFINITY),
+                        );
+
+                        // "Add akk to PATH" (round check)
+                        let row = Rect::from_min_size(o + vec2(206.0, 154.0), vec2(260.0, 28.0));
+                        let rr = ui.interact(row, ui.id().with("path"), Sense::click());
+                        if rr.clicked() {
+                            self.add_path = !self.add_path;
+                        }
+                        let center = o + vec2(218.0, 168.0);
+                        p.circle(center, 11.0, Color32::TRANSPARENT, Stroke::new(3.0, INK));
+                        if self.add_path {
+                            p.circle_filled(center, 6.0, BLUE);
+                        }
+                        p.text(o + vec2(245.0, 168.0), Align2::LEFT_CENTER, "Add akk to PATH", FontId::monospace(16.0), INK);
+
+                        if big_button(ui, &p, Rect::from_min_size(o + vec2(197.0, 197.0), vec2(383.0, 62.0)), "Install")
+                            && !self.dir.trim().is_empty()
+                        {
+                            self.start(false);
+                        }
+
+                        // small uninstall link
+                        let ur = Rect::from_center_size(o + vec2(616.0, 228.0), vec2(70.0, 20.0));
+                        let uresp = ui.interact(ur, ui.id().with("uninstall"), Sense::click());
+                        let ucol = if uresp.hovered() { BLUE } else { Color32::from_rgb(20, 60, 100) };
+                        p.text(ur.center(), Align2::CENTER_CENTER, "Uninstall", FontId::monospace(12.0), ucol);
+                        if uresp.hovered() {
+                            ctx.set_cursor_icon(CursorIcon::PointingHand);
+                        }
+                        if uresp.clicked() && !self.dir.trim().is_empty() {
+                            self.start(true);
+                        }
+                    }
+
+                    // --------------------------------------------- installing (screenshot 2)
+                    Page::Working => {
+                        draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(22.0, 17.0), vec2(168.0, 168.0)));
+                        heading(&p, o + vec2(0.0, 53.0), if self.uninstalling { "Uninstalling..." } else { "Installing..." });
+
+                        let bar = Rect::from_min_size(o + vec2(207.0, 81.0), vec2(407.0, 47.0));
+                        thick_box(&p, bar, 18.0, LIGHT, 6.0);
+                        if self.shown > 0.0 {
+                            let inner = bar.shrink(6.0);
+                            let w = (inner.width() * self.shown).max(30.0);
+                            thick_box(&p, Rect::from_min_size(inner.min, vec2(w, inner.height())), 13.0, BLUE, 5.0);
+                        }
+                        let pct_col = if self.shown > 0.55 { Color32::WHITE } else { INK };
+                        p.text(
+                            bar.center(),
+                            Align2::CENTER_CENTER,
+                            format!("{:.0}%", self.shown * 100.0),
+                            FontId::monospace(18.0),
+                            pct_col,
+                        );
+
+                        let left = if self.shown > 0.08 {
+                            let rem = self.started.elapsed().as_secs_f32() * (1.0 - self.shown) / self.shown;
+                            if rem < 45.0 {
+                                "Less than a minute left".to_string()
+                            } else {
+                                let n = (rem / 60.0).ceil() as u32;
+                                if n <= 1 { "About 1 minute left".to_string() } else { format!("{n} minutes left") }
+                            }
+                        } else {
+                            "Calculating...".to_string()
+                        };
+                        p.text(o + vec2(217.0, 153.0), Align2::LEFT_CENTER, left, FontId::monospace(15.0), INK);
+
+                        let t = &self.msgs[self.msg_idx];
+                        let rect = Rect::from_center_size(pos2(full.center().x, o.y + 222.0), t.size);
+                        p.image(
+                            t.handle.id(),
+                            rect,
+                            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
+
+                    // ------------------------------------------------------- finished
+                    Page::Finished => {
+                        draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(22.0, 17.0), vec2(168.0, 168.0)));
+                        let title = if self.uninstalling { "Uninstall complete!" } else { "Installation complete!" };
+                        heading(&p, o + vec2(0.0, 48.0), title);
+
+                        if self.uninstalling {
+                            p.text(o + vec2(207.0, 96.0), Align2::LEFT_CENTER, "akk was removed from:", FontId::monospace(14.0), INK);
+                            p.text(o + vec2(207.0, 122.0), Align2::LEFT_CENTER, self.dir.trim(), FontId::monospace(13.0), INK);
+                        } else {
+                            p.text(o + vec2(207.0, 88.0), Align2::LEFT_CENTER, "Open a NEW terminal, then try:", FontId::monospace(14.0), INK);
+                            let code = Rect::from_min_size(o + vec2(207.0, 104.0), vec2(407.0, 62.0));
+                            thick_box(&p, code, 14.0, LIGHT, 4.0);
+                            p.text(code.min + vec2(18.0, 20.0), Align2::LEFT_CENTER, "akk --version", FontId::monospace(15.0), INK);
+                            p.text(code.min + vec2(18.0, 43.0), Align2::LEFT_CENTER, "akk <file_name>", FontId::monospace(15.0), INK);
+                            p.text(o + vec2(207.0, 182.0), Align2::LEFT_CENTER, format!("Installed in {}", self.dir.trim()), FontId::monospace(11.0), INK);
+                        }
+
+                        if big_button(ui, &p, Rect::from_min_size(o + vec2(207.0, 208.0), vec2(407.0, 50.0)), "Finish") {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+
+                    // --------------------------------------------------------- failed
+                    Page::Failed(err) => {
+                        draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(22.0, 17.0), vec2(168.0, 168.0)));
+                        heading(&p, o + vec2(0.0, 48.0), "Something went wrong");
+                        let mut text: String = err.chars().take(260).collect();
+                        if err.chars().count() > 260 {
+                            text.push_str("...");
+                        }
+                        let galley = p.layout(text, FontId::monospace(13.0), INK, 407.0);
+                        p.galley(o + vec2(207.0, 78.0), galley, INK);
+                        if big_button(ui, &p, Rect::from_min_size(o + vec2(207.0, 208.0), vec2(407.0, 50.0)), "Back") {
+                            self.page = Page::Setup;
+                        }
+                    }
+                }
+            });
     }
 }
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([520.0, 400.0])
+            .with_title("Akkhara Installer")
+            .with_inner_size([WIN_W, WIN_H])
+            .with_decorations(false)
+            .with_transparent(true)
             .with_resizable(false),
+        centered: true,
         ..Default::default()
     };
     eframe::run_native(
         "Akkhara Installer",
         options,
-        Box::new(|_cc| Ok(Box::new(InstallerApp::default()))),
+        Box::new(|cc| Ok(Box::new(InstallerApp::new(cc)))),
     )
 }
