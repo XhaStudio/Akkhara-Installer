@@ -343,6 +343,89 @@ fn next_index(cur: usize, n: usize) -> usize {
     i
 }
 
+// ------------------------------------------------------- update checking
+
+#[derive(Clone)]
+enum Installed {
+    None,            // no akk in the install folder
+    Unknown,         // akk exists but its version could not be read
+    Version(String), // e.g. "1.1.0"
+}
+
+enum Check {
+    Latest(Option<String>),
+    Installed(String, Installed), // (folder that was checked, result)
+}
+
+fn parse_version(text: &str) -> Option<String> {
+    text.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .map(|t| t.trim_matches('.'))
+        .find(|t| {
+            t.contains('.') && t.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(|t| t.to_string())
+}
+
+fn version_nums(v: &str) -> Vec<u64> {
+    v.trim_start_matches('v')
+        .split('.')
+        .map(|p| p.parse().unwrap_or(0))
+        .collect()
+}
+
+fn is_newer(latest: &str, installed: &str) -> bool {
+    let (a, b) = (version_nums(latest), version_nums(installed));
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (*a.get(i).unwrap_or(&0), *b.get(i).unwrap_or(&0));
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
+/// Runs `<dir>/akk --version` and reads the version number from its output.
+fn installed_version(dir: &Path) -> Installed {
+    let bin = dir.join(bin_name());
+    if !bin.exists() {
+        return Installed::None;
+    }
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("--version")
+        .stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flash
+    }
+    match cmd.output() {
+        Ok(o) => {
+            let text = format!(
+                "{} {}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            match parse_version(&text) {
+                Some(v) => Installed::Version(v),
+                None => Installed::Unknown,
+            }
+        }
+        Err(_) => Installed::Unknown,
+    }
+}
+
+fn fetch_latest_tag() -> Option<String> {
+    let v: serde_json::Value = ureq::get(&format!("https://api.github.com/repos/{REPO}/releases/latest"))
+        .set("User-Agent", "akkhara-installer")
+        .set("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(10))
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    v["tag_name"].as_str().map(|s| s.to_string())
+}
+
 #[derive(Clone)]
 enum Page {
     Setup,
@@ -365,12 +448,25 @@ struct InstallerApp {
     msg_at: Instant,
     logo: Tex,
     msgs: Vec<Tex>,
+    check_tx: Sender<Check>,
+    check_rx: Receiver<Check>,
+    latest: Option<String>,
+    installed: Option<Installed>,
+    checked_dir: String,
+    updating: bool,
 }
 
 impl InstallerApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = &cc.egui_ctx;
-        Self {
+        let (check_tx, check_rx) = channel();
+        let mut app = Self {
+            check_tx,
+            check_rx,
+            latest: None,
+            installed: None,
+            checked_dir: String::new(),
+            updating: false,
             page: Page::Setup,
             dir: default_dir().to_string_lossy().to_string(),
             add_path: true,
@@ -388,10 +484,47 @@ impl InstallerApp {
                 .enumerate()
                 .map(|(i, b)| load_tex(ctx, &format!("msg{i}"), b, 2.0))
                 .collect(),
+        };
+        app.check_installed(ctx);
+        app.check_latest(ctx);
+        app
+    }
+
+    /// Look at the install folder in the background (is akk there, and which version?).
+    fn check_installed(&mut self, ctx: &egui::Context) {
+        self.installed = None;
+        self.checked_dir = self.dir.trim().to_string();
+        let dir = PathBuf::from(&self.checked_dir);
+        let key = self.checked_dir.clone();
+        let tx = self.check_tx.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(Check::Installed(key, installed_version(&dir)));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Ask GitHub for the newest release tag in the background.
+    fn check_latest(&self, ctx: &egui::Context) {
+        let tx = self.check_tx.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(Check::Latest(fetch_latest_tag()));
+            ctx.request_repaint();
+        });
+    }
+
+    /// True only when akk is already installed and a newer release exists.
+    fn update_available(&self) -> bool {
+        match (&self.installed, &self.latest) {
+            (Some(Installed::Version(v)), Some(l)) => is_newer(l, v),
+            (Some(Installed::Unknown), Some(_)) => true,
+            _ => false,
         }
     }
 
     fn start(&mut self, remove: bool) {
+        self.updating = !remove && self.update_available();
         let (tx, rx) = channel();
         self.rx = Some(rx);
         self.uninstalling = remove;
@@ -486,6 +619,18 @@ impl eframe::App for InstallerApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ---- results of the version checks
+        while let Ok(m) = self.check_rx.try_recv() {
+            match m {
+                Check::Latest(tag) => self.latest = tag,
+                Check::Installed(dir, state) => {
+                    if dir == self.checked_dir {
+                        self.installed = Some(state);
+                    }
+                }
+            }
+        }
+
         // ---- messages from the worker thread
         if let Some(rx) = &self.rx {
             while let Ok(m) = rx.try_recv() {
@@ -558,7 +703,7 @@ impl eframe::App for InstallerApp {
                             9.0,
                             6.0,
                         ));
-                        ui.put(
+                        let field_resp = ui.put(
                             field.shrink2(vec2(14.0, 4.0)),
                             egui::TextEdit::singleline(&mut self.dir)
                                 .frame(false)
@@ -567,6 +712,9 @@ impl eframe::App for InstallerApp {
                                 .vertical_align(Align::Center)
                                 .desired_width(f32::INFINITY),
                         );
+                        if field_resp.lost_focus() && self.dir.trim() != self.checked_dir {
+                            self.check_installed(ctx);
+                        }
 
                         // "Add akk to PATH" (round check)
                         let row = Rect::from_min_size(o + vec2(206.0, 154.0), vec2(260.0, 28.0));
@@ -581,7 +729,8 @@ impl eframe::App for InstallerApp {
                         }
                         p.text(o + vec2(245.0, 168.0), Align2::LEFT_CENTER, "Add akk to PATH", FontId::monospace(16.0), INK);
 
-                        if big_button(ui, &p, Rect::from_min_size(o + vec2(197.0, 197.0), vec2(383.0, 62.0)), "Install")
+                        let btn_label = if self.update_available() { "Update" } else { "Install" };
+                        if big_button(ui, &p, Rect::from_min_size(o + vec2(197.0, 197.0), vec2(383.0, 62.0)), btn_label)
                             && !self.dir.trim().is_empty()
                         {
                             self.start(false);
@@ -603,7 +752,7 @@ impl eframe::App for InstallerApp {
                     // --------------------------------------------- installing (screenshot 2)
                     Page::Working => {
                         draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(22.0, 17.0), vec2(168.0, 168.0)));
-                        heading(&p, o + vec2(0.0, 53.0), if self.uninstalling { "Uninstalling..." } else { "Installing..." });
+                        heading(&p, o + vec2(0.0, 53.0), if self.uninstalling { "Uninstalling..." } else if self.updating { "Updating..." } else { "Installing..." });
 
                         let bar = Rect::from_min_size(o + vec2(207.0, 81.0), vec2(407.0, 47.0));
                         thick_box(&p, bar, 18.0, LIGHT, 6.0);
@@ -647,7 +796,13 @@ impl eframe::App for InstallerApp {
                     // ------------------------------------------------------- finished
                     Page::Finished => {
                         draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(22.0, 17.0), vec2(168.0, 168.0)));
-                        let title = if self.uninstalling { "Uninstall complete!" } else { "Installation complete!" };
+                        let title = if self.uninstalling {
+                            "Uninstall complete!"
+                        } else if self.updating {
+                            "Update complete!"
+                        } else {
+                            "Installation complete!"
+                        };
                         heading(&p, o + vec2(0.0, 48.0), title);
 
                         if self.uninstalling {
@@ -679,6 +834,7 @@ impl eframe::App for InstallerApp {
                         p.galley(o + vec2(207.0, 78.0), galley, INK);
                         if big_button(ui, &p, Rect::from_min_size(o + vec2(207.0, 208.0), vec2(407.0, 50.0)), "Back") {
                             self.page = Page::Setup;
+                            self.check_installed(ctx);
                         }
                     }
                 }
