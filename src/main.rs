@@ -12,6 +12,8 @@ use std::{
 };
 
 const REPO: &str = "XhaStudio/Akkhara-Programming-Language";
+const INSTALLER_REPO: &str = "XhaStudio/Akkhara-Installer";
+const INSTALLER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 enum Msg {
     Progress(f32),
@@ -343,6 +345,95 @@ fn next_index(cur: usize, n: usize) -> usize {
     i
 }
 
+/// Name of this installer's own release asset for the current OS/CPU
+/// (must match the names produced by .github/workflows/release.yml).
+fn installer_asset_name() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => Some("Akkhara-Installer-windows-x86_64.exe"),
+        ("linux", "x86_64") => Some("Akkhara-Installer-linux-x86_64"),
+        ("macos", "aarch64") => Some("Akkhara-Installer-macos-aarch64"),
+        ("macos", "x86_64") => Some("Akkhara-Installer-macos-x86_64"),
+        _ => None,
+    }
+}
+
+fn download(url: &str, tx: &Sender<Msg>, from: f32, to: f32) -> Result<Vec<u8>, String> {
+    let resp = ureq::get(url)
+        .set("User-Agent", "akkhara-installer")
+        .call()
+        .map_err(|e| format!("Download failed: {e}"))?;
+    let total: Option<u64> = resp.header("Content-Length").and_then(|v| v.parse().ok());
+    let mut reader = resp.into_reader().take(300_000_000);
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 32 * 1024];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|e| format!("Download failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(t) = total.filter(|t| *t > 0) {
+            let frac = (buf.len() as f32 / t as f32).min(1.0);
+            let _ = tx.send(Msg::Progress(from + (to - from) * frac));
+        }
+    }
+    Ok(buf)
+}
+
+/// Replace this running installer with the newest one from the installer repo.
+/// (A running exe can be renamed but not overwritten, so: current -> .old, new -> current.)
+fn self_update(exe: PathBuf, tx: &Sender<Msg>) -> Result<(), String> {
+    let prog = |v: f32| {
+        let _ = tx.send(Msg::Progress(v));
+    };
+    let asset = installer_asset_name().ok_or("This platform is not supported yet.")?;
+    prog(0.03);
+
+    let release: serde_json::Value =
+        ureq::get(&format!("https://api.github.com/repos/{INSTALLER_REPO}/releases/latest"))
+            .set("User-Agent", "akkhara-installer")
+            .set("Accept", "application/vnd.github+json")
+            .call()
+            .map_err(|e| format!("Could not reach GitHub: {e}"))?
+            .into_json()
+            .map_err(|e| e.to_string())?;
+    prog(0.08);
+
+    let tag = release["tag_name"].as_str().unwrap_or("unknown").to_string();
+    let url = release["assets"]
+        .as_array()
+        .and_then(|a| a.iter().find(|x| x["name"] == asset))
+        .and_then(|x| x["browser_download_url"].as_str())
+        .ok_or_else(|| format!("Installer release {tag} has no asset named {asset}"))?
+        .to_string();
+
+    let buf = download(&url, tx, 0.08, 0.85)?;
+    if buf.len() < 100_000 {
+        return Err("Downloaded installer looks too small; aborting.".into());
+    }
+
+    let new_path = exe.with_extension("new");
+    let old_path = exe.with_extension("old");
+    fs::write(&new_path, &buf).map_err(|e| format!("Could not write the new installer: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&new_path, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    }
+    prog(0.9);
+
+    let _ = fs::remove_file(&old_path);
+    fs::rename(&exe, &old_path).map_err(|e| format!("Could not replace the installer: {e}"))?;
+    if let Err(e) = fs::rename(&new_path, &exe) {
+        let _ = fs::rename(&old_path, &exe); // roll back
+        return Err(format!("Could not replace the installer: {e}"));
+    }
+    prog(1.0);
+    Ok(())
+}
+
 // ------------------------------------------------------- update checking
 
 #[derive(Clone)]
@@ -354,6 +445,7 @@ enum Installed {
 
 enum Check {
     Latest(Option<String>),
+    InstallerLatest(Option<String>),
     Installed(String, Installed), // (folder that was checked, result)
 }
 
@@ -414,8 +506,8 @@ fn installed_version(dir: &Path) -> Installed {
     }
 }
 
-fn fetch_latest_tag() -> Option<String> {
-    let v: serde_json::Value = ureq::get(&format!("https://api.github.com/repos/{REPO}/releases/latest"))
+fn fetch_latest_tag(repo: &str) -> Option<String> {
+    let v: serde_json::Value = ureq::get(&format!("https://api.github.com/repos/{repo}/releases/latest"))
         .set("User-Agent", "akkhara-installer")
         .set("Accept", "application/vnd.github+json")
         .timeout(Duration::from_secs(10))
@@ -451,6 +543,9 @@ struct InstallerApp {
     check_tx: Sender<Check>,
     check_rx: Receiver<Check>,
     latest: Option<String>,
+    installer_latest: Option<String>,
+    self_updating: bool,
+    exe_path: Option<PathBuf>,
     installed: Option<Installed>,
     checked_dir: String,
     updating: bool,
@@ -464,6 +559,9 @@ impl InstallerApp {
             check_tx,
             check_rx,
             latest: None,
+            installer_latest: None,
+            self_updating: false,
+            exe_path: std::env::current_exe().ok(),
             installed: None,
             checked_dir: String::new(),
             updating: false,
@@ -506,11 +604,48 @@ impl InstallerApp {
 
     /// Ask GitHub for the newest release tag in the background.
     fn check_latest(&self, ctx: &egui::Context) {
-        let tx = self.check_tx.clone();
-        let ctx = ctx.clone();
+        let (tx, ctx2) = (self.check_tx.clone(), ctx.clone());
         thread::spawn(move || {
-            let _ = tx.send(Check::Latest(fetch_latest_tag()));
-            ctx.request_repaint();
+            let _ = tx.send(Check::Latest(fetch_latest_tag(REPO)));
+            ctx2.request_repaint();
+        });
+        let (tx, ctx2) = (self.check_tx.clone(), ctx.clone());
+        thread::spawn(move || {
+            let _ = tx.send(Check::InstallerLatest(fetch_latest_tag(INSTALLER_REPO)));
+            ctx2.request_repaint();
+        });
+    }
+
+    /// True when a newer installer release exists than the one running now.
+    fn installer_update_available(&self) -> bool {
+        self.installer_latest
+            .as_deref()
+            .map(|l| is_newer(l, INSTALLER_VERSION))
+            .unwrap_or(false)
+    }
+
+    fn start_self_update(&mut self) {
+        let Some(exe) = self.exe_path.clone() else {
+            self.page = Page::Failed("Could not find the installer's own file.".into());
+            return;
+        };
+        let (tx, rx) = channel();
+        self.rx = Some(rx);
+        self.self_updating = true;
+        self.uninstalling = false;
+        self.updating = false;
+        self.page = Page::Working;
+        self.target = 0.0;
+        self.shown = 0.0;
+        self.done = false;
+        self.started = Instant::now();
+        self.msg_at = Instant::now();
+        self.msg_idx = next_index(usize::MAX, self.msgs.len());
+        thread::spawn(move || {
+            let _ = match self_update(exe, &tx) {
+                Ok(()) => tx.send(Msg::Done),
+                Err(e) => tx.send(Msg::Fail(e)),
+            };
         });
     }
 
@@ -528,6 +663,7 @@ impl InstallerApp {
         let (tx, rx) = channel();
         self.rx = Some(rx);
         self.uninstalling = remove;
+        self.self_updating = false;
         self.page = Page::Working;
         self.target = 0.0;
         self.shown = 0.0;
@@ -623,6 +759,7 @@ impl eframe::App for InstallerApp {
         while let Ok(m) = self.check_rx.try_recv() {
             match m {
                 Check::Latest(tag) => self.latest = tag,
+                Check::InstallerLatest(tag) => self.installer_latest = tag,
                 Check::Installed(dir, state) => {
                     if dir == self.checked_dir {
                         self.installed = Some(state);
@@ -729,11 +866,20 @@ impl eframe::App for InstallerApp {
                         }
                         p.text(o + vec2(245.0, 168.0), Align2::LEFT_CENTER, "Add akk to PATH", FontId::monospace(16.0), INK);
 
-                        let btn_label = if self.update_available() { "Update" } else { "Install" };
-                        if big_button(ui, &p, Rect::from_min_size(o + vec2(197.0, 197.0), vec2(383.0, 62.0)), btn_label)
-                            && !self.dir.trim().is_empty()
-                        {
-                            self.start(false);
+                        let installer_update = self.installer_update_available();
+                        let btn_label = if installer_update {
+                            "Update Installer"
+                        } else if self.update_available() {
+                            "Update"
+                        } else {
+                            "Install"
+                        };
+                        if big_button(ui, &p, Rect::from_min_size(o + vec2(197.0, 197.0), vec2(383.0, 62.0)), btn_label) {
+                            if installer_update {
+                                self.start_self_update();
+                            } else if !self.dir.trim().is_empty() {
+                                self.start(false);
+                            }
                         }
 
                         // small uninstall link
@@ -752,7 +898,7 @@ impl eframe::App for InstallerApp {
                     // --------------------------------------------- installing (screenshot 2)
                     Page::Working => {
                         draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(22.0, 17.0), vec2(168.0, 168.0)));
-                        heading(&p, o + vec2(0.0, 53.0), if self.uninstalling { "Uninstalling..." } else if self.updating { "Updating..." } else { "Installing..." });
+                        heading(&p, o + vec2(0.0, 53.0), if self.self_updating { "Updating installer..." } else if self.uninstalling { "Uninstalling..." } else if self.updating { "Updating..." } else { "Installing..." });
 
                         let bar = Rect::from_min_size(o + vec2(207.0, 81.0), vec2(407.0, 47.0));
                         thick_box(&p, bar, 18.0, LIGHT, 6.0);
@@ -796,7 +942,9 @@ impl eframe::App for InstallerApp {
                     // ------------------------------------------------------- finished
                     Page::Finished => {
                         draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(22.0, 17.0), vec2(168.0, 168.0)));
-                        let title = if self.uninstalling {
+                        let title = if self.self_updating {
+                            "Installer updated!"
+                        } else if self.uninstalling {
                             "Uninstall complete!"
                         } else if self.updating {
                             "Update complete!"
@@ -805,7 +953,9 @@ impl eframe::App for InstallerApp {
                         };
                         heading(&p, o + vec2(0.0, 48.0), title);
 
-                        if self.uninstalling {
+                        if self.self_updating {
+                            p.text(o + vec2(207.0, 96.0), Align2::LEFT_CENTER, "Restart to use the new version.", FontId::monospace(14.0), INK);
+                        } else if self.uninstalling {
                             p.text(o + vec2(207.0, 96.0), Align2::LEFT_CENTER, "akk was removed from:", FontId::monospace(14.0), INK);
                             p.text(o + vec2(207.0, 122.0), Align2::LEFT_CENTER, self.dir.trim(), FontId::monospace(13.0), INK);
                         } else {
@@ -817,7 +967,12 @@ impl eframe::App for InstallerApp {
                             p.text(o + vec2(207.0, 182.0), Align2::LEFT_CENTER, format!("Installed in {}", self.dir.trim()), FontId::monospace(11.0), INK);
                         }
 
-                        if big_button(ui, &p, Rect::from_min_size(o + vec2(207.0, 208.0), vec2(407.0, 50.0)), "Finish") {
+                        if big_button(ui, &p, Rect::from_min_size(o + vec2(207.0, 208.0), vec2(407.0, 50.0)), if self.self_updating { "Restart" } else { "Finish" }) {
+                            if self.self_updating {
+                                if let Some(exe) = &self.exe_path {
+                                    let _ = std::process::Command::new(exe).spawn();
+                                }
+                            }
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     }
@@ -856,6 +1011,10 @@ fn window_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    // remove the previous installer left behind by a self-update (best effort)
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = fs::remove_file(exe.with_extension("old"));
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Akkhara Installer")
         .with_inner_size([WIN_W, WIN_H])
