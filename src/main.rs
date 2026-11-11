@@ -211,7 +211,13 @@ fn install(dir: PathBuf, add_path: bool, tx: &Sender<Msg>) -> Result<(), String>
             .set("User-Agent", "akkhara-installer")
             .set("Accept", "application/vnd.github+json")
             .call()
-            .map_err(|e| format!("Could not reach GitHub (is there a published release?): {e}"))?
+            .map_err(|e| match e {
+                // No network / DNS failure / connection refused -> friendly offline message
+                ureq::Error::Transport(_) => OFFLINE_MSG.to_string(),
+                ureq::Error::Status(code, _) => {
+                    format!("GitHub returned an error (HTTP {code}). Please try again later.")
+                }
+            })?
             .into_json()
             .map_err(|e| e.to_string())?;
     prog(0.08);
@@ -308,6 +314,10 @@ const WIN_W: f32 = 660.0;
 const WIN_H: f32 = 280.0;
 
 const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
+// Shown when the installer cannot reach GitHub because there is no internet.
+const OFFLINE_MSG: &str = "No internet connection. Please check your network and try again.";
+// Same message in Myanmar (pre-rendered with proper text shaping, like the messages below).
+const OFFLINE_MY_PNG: &[u8] = include_bytes!("../assets/offline_my.png");
 // Pre-rendered with proper Myanmar text shaping (egui cannot shape Burmese itself).
 const MESSAGE_PNGS: [&[u8]; 4] = [
     include_bytes!("../assets/msg1.png"),
@@ -540,6 +550,7 @@ struct InstallerApp {
     msg_at: Instant,
     logo: Tex,
     msgs: Vec<Tex>,
+    offline_my: Tex,
     check_tx: Sender<Check>,
     check_rx: Receiver<Check>,
     latest: Option<String>,
@@ -582,6 +593,7 @@ impl InstallerApp {
                 .enumerate()
                 .map(|(i, b)| load_tex(ctx, &format!("msg{i}"), b, 2.0))
                 .collect(),
+            offline_my: load_tex(ctx, "offline_my", OFFLINE_MY_PNG, 2.0),
         };
         app.check_installed(ctx);
         app.check_latest(ctx);
@@ -987,6 +999,16 @@ impl eframe::App for InstallerApp {
                         }
                         let galley = p.layout(text, FontId::monospace(13.0), INK, 407.0);
                         p.galley(o + vec2(207.0, 78.0), galley, INK);
+                        if err == OFFLINE_MSG {
+                            let t = &self.offline_my;
+                            let rect = Rect::from_min_size(o + vec2(207.0, 128.0), t.size);
+                            p.image(
+                                t.handle.id(),
+                                rect,
+                                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        }
                         if big_button(ui, &p, Rect::from_min_size(o + vec2(207.0, 208.0), vec2(407.0, 50.0)), "Back") {
                             self.page = Page::Setup;
                             self.check_installed(ctx);
