@@ -198,6 +198,151 @@ fn extract_binary(asset: &str, data: &[u8]) -> Result<Vec<u8>, String> {
     Err(format!("`{want}` was not found inside {asset}"))
 }
 
+// ------------------------------------------------- errors, checksums, notes
+
+/// Turn a ureq error into a short message for the error page.
+fn gh_error(e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Transport(t) => match t.kind() {
+            ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Io => {
+                OFFLINE_MSG.to_string()
+            }
+            _ => format!("Network error: {t}"),
+        },
+        ureq::Error::Status(code, resp) => {
+            let limited = code == 429
+                || (code == 403 && resp.header("x-ratelimit-remaining") == Some("0"));
+            if limited {
+                RATE_LIMIT_MSG.to_string()
+            } else if code == 404 {
+                "Not found on GitHub (HTTP 404). The release or file may have been removed.".to_string()
+            } else {
+                format!("GitHub returned an error (HTTP {code}). Please try again later.")
+            }
+        }
+    }
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(data))
+}
+
+/// Find the SHA256 for `asset` in a checksum file. Accepts a bare hash,
+/// `<hash>  <file>` (sha256sum) and multi-line SHA256SUMS files.
+fn parse_checksum(text: &str, asset: &str) -> Option<String> {
+    let mut lone = None;
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let Some(hash) = it.next() else { continue };
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let hash = hash.to_ascii_lowercase();
+        match it.next() {
+            Some(name) => {
+                let name = name.trim_start_matches('*');
+                if Path::new(name).file_name().and_then(|n| n.to_str()) == Some(asset) {
+                    return Some(hash);
+                }
+            }
+            None => lone = Some(hash),
+        }
+    }
+    lone
+}
+
+/// URL of the checksum file for `asset` in a release: `<asset>.sha256`, or a combined SHA256SUMS file.
+fn find_checksum_url(release: &serde_json::Value, asset: &str) -> Option<String> {
+    let assets = release["assets"].as_array()?;
+    let own = format!("{asset}.sha256");
+    let combined = ["SHA256SUMS", "SHA256SUMS.txt", "sha256sums.txt", "checksums.txt"];
+    let pick = |pred: &dyn Fn(&str) -> bool| {
+        assets
+            .iter()
+            .find(|a| a["name"].as_str().map(pred).unwrap_or(false))
+            .and_then(|a| a["browser_download_url"].as_str())
+            .map(String::from)
+    };
+    pick(&|n| n == own).or_else(|| pick(&|n| combined.contains(&n)))
+}
+
+/// Compare the downloaded bytes with the checksum published in the release.
+fn verify_checksum(release: &serde_json::Value, asset: &str, data: &[u8]) -> Result<(), String> {
+    let Some(url) = find_checksum_url(release, asset) else {
+        return if REQUIRE_CHECKSUM {
+            Err(format!("The release has no SHA256 checksum for {asset}."))
+        } else {
+            Ok(())
+        };
+    };
+    let resp = ureq::get(&url)
+        .set("User-Agent", "akkhara-installer")
+        .timeout(Duration::from_secs(15))
+        .call()
+        .map_err(gh_error)?;
+    let mut text = String::new();
+    resp.into_reader()
+        .take(64 * 1024)
+        .read_to_string(&mut text)
+        .map_err(|_| OFFLINE_MSG.to_string())?;
+    let want = parse_checksum(&text, asset)
+        .ok_or_else(|| format!("Could not read the checksum file for {asset}."))?;
+    if sha256_hex(data) != want {
+        return Err(CHECKSUM_MSG.to_string());
+    }
+    Ok(())
+}
+
+/// Release notes (Markdown) -> plain text the installer font can draw.
+/// egui's built-in fonts have no Myanmar glyphs, so non-ASCII characters are dropped.
+fn clean_notes(body: &str) -> String {
+    fn strip_links(s: &str) -> String {
+        let mut out = String::new();
+        let mut it = s.chars().peekable();
+        let mut skip = false;
+        while let Some(c) = it.next() {
+            if skip {
+                if c == ')' {
+                    skip = false;
+                }
+                continue;
+            }
+            if c == ']' && it.peek() == Some(&'(') {
+                it.next();
+                skip = true;
+                continue;
+            }
+            if c == '[' {
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for raw in body.lines() {
+        let t = raw.trim();
+        let bullet = t.starts_with("- ") || t.starts_with("* ");
+        let t = t.trim_start_matches(|c| c == '#' || c == '>' || c == ' ');
+        let t = if bullet { t.trim_start_matches(|c| c == '-' || c == '*' || c == ' ') } else { t };
+        let t = strip_links(t);
+        if t.contains("http") {
+            continue; // bare "Full changelog: https://..." style lines
+        }
+        let t: String = t
+            .chars()
+            .filter(|c| c.is_ascii() && !c.is_ascii_control() && !matches!(c, '*' | '`' | '#'))
+            .collect();
+        let t = t.trim();
+        if t.is_empty() {
+            continue;
+        }
+        lines.push(if bullet { format!("- {t}") } else { t.to_string() });
+    }
+    lines.join("\n")
+}
+
 fn install(dir: PathBuf, add_path: bool, tx: &Sender<Msg>) -> Result<(), String> {
     let prog = |v: f32| {
         let _ = tx.send(Msg::Progress(v));
@@ -211,13 +356,7 @@ fn install(dir: PathBuf, add_path: bool, tx: &Sender<Msg>) -> Result<(), String>
             .set("User-Agent", "akkhara-installer")
             .set("Accept", "application/vnd.github+json")
             .call()
-            .map_err(|e| match e {
-                // No network / DNS failure / connection refused -> friendly offline message
-                ureq::Error::Transport(_) => OFFLINE_MSG.to_string(),
-                ureq::Error::Status(code, _) => {
-                    format!("GitHub returned an error (HTTP {code}). Please try again later.")
-                }
-            })?
+            .map_err(gh_error)?
             .into_json()
             .map_err(|e| e.to_string())?;
     prog(0.08);
@@ -230,29 +369,13 @@ fn install(dir: PathBuf, add_path: bool, tx: &Sender<Msg>) -> Result<(), String>
         .ok_or_else(|| format!("Release {tag} has no asset named {asset}"))?
         .to_string();
 
-    let resp = ureq::get(&url)
-        .set("User-Agent", "akkhara-installer")
-        .call()
-        .map_err(|e| format!("Download failed: {e}"))?;
-    let total: Option<u64> = resp.header("Content-Length").and_then(|v| v.parse().ok());
-    let mut reader = resp.into_reader().take(300_000_000);
-    let mut buf = Vec::new();
-    let mut chunk = vec![0u8; 32 * 1024];
-    loop {
-        let n = reader
-            .read(&mut chunk)
-            .map_err(|e| format!("Download failed: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(t) = total.filter(|t| *t > 0) {
-            prog(0.08 + 0.72 * (buf.len() as f32 / t as f32).min(1.0));
-        }
-    }
+    let buf = download(&url, tx, 0.08, 0.78)?;
     if buf.len() < 1024 {
         return Err("Downloaded file looks too small; aborting.".into());
     }
+    prog(0.80);
+
+    verify_checksum(&release, asset, &buf)?;
     prog(0.82);
 
     let exe = extract_binary(asset, &buf)?;
@@ -314,10 +437,22 @@ const WIN_W: f32 = 660.0;
 const WIN_H: f32 = 280.0;
 
 const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
-// Shown when the installer cannot reach GitHub because there is no internet.
+// ---- error messages
+// Each of these has a pre-rendered Myanmar version (egui cannot shape Burmese text, so the
+// Myanmar lines are PNG images, like the install-screen messages). The error page looks the
+// image up by comparing the message text, so keep the strings and ERROR_IMAGES in sync.
 const OFFLINE_MSG: &str = "No internet connection. Please check your network and try again.";
-// Same message in Myanmar (pre-rendered with proper text shaping, like the messages below).
-const OFFLINE_MY_PNG: &[u8] = include_bytes!("../assets/offline_my.png");
+const RATE_LIMIT_MSG: &str = "GitHub rate limit reached. Please wait a few minutes and try again.";
+const CHECKSUM_MSG: &str = "Checksum mismatch: the downloaded file may be corrupted. Please try again.";
+const ERROR_IMAGES: [(&str, &[u8]); 3] = [
+    (OFFLINE_MSG, include_bytes!("../assets/offline_my.png")),
+    (RATE_LIMIT_MSG, include_bytes!("../assets/rate_limit_my.png")),
+    (CHECKSUM_MSG, include_bytes!("../assets/checksum_my.png")),
+];
+
+/// Set to true to refuse installs when the release has no SHA256 checksum file.
+/// (false = verify when a checksum is published, otherwise continue.)
+const REQUIRE_CHECKSUM: bool = false;
 // Pre-rendered with proper Myanmar text shaping (egui cannot shape Burmese itself).
 const MESSAGE_PNGS: [&[u8]; 4] = [
     include_bytes!("../assets/msg1.png"),
@@ -371,15 +506,14 @@ fn download(url: &str, tx: &Sender<Msg>, from: f32, to: f32) -> Result<Vec<u8>, 
     let resp = ureq::get(url)
         .set("User-Agent", "akkhara-installer")
         .call()
-        .map_err(|e| format!("Download failed: {e}"))?;
+        .map_err(gh_error)?;
     let total: Option<u64> = resp.header("Content-Length").and_then(|v| v.parse().ok());
     let mut reader = resp.into_reader().take(300_000_000);
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; 32 * 1024];
     loop {
-        let n = reader
-            .read(&mut chunk)
-            .map_err(|e| format!("Download failed: {e}"))?;
+        // a read error half-way through almost always means the connection dropped
+        let n = reader.read(&mut chunk).map_err(|_| OFFLINE_MSG.to_string())?;
         if n == 0 {
             break;
         }
@@ -406,7 +540,7 @@ fn self_update(exe: PathBuf, tx: &Sender<Msg>) -> Result<(), String> {
             .set("User-Agent", "akkhara-installer")
             .set("Accept", "application/vnd.github+json")
             .call()
-            .map_err(|e| format!("Could not reach GitHub: {e}"))?
+            .map_err(gh_error)?
             .into_json()
             .map_err(|e| e.to_string())?;
     prog(0.08);
@@ -423,6 +557,7 @@ fn self_update(exe: PathBuf, tx: &Sender<Msg>) -> Result<(), String> {
     if buf.len() < 100_000 {
         return Err("Downloaded installer looks too small; aborting.".into());
     }
+    verify_checksum(&release, asset, &buf)?;
 
     let new_path = exe.with_extension("new");
     let old_path = exe.with_extension("old");
@@ -454,8 +589,9 @@ enum Installed {
 }
 
 enum Check {
-    Latest(Option<String>),
+    Latest(Option<(String, String)>), // (tag, release notes)
     InstallerLatest(Option<String>),
+    Online(bool),                     // result of the "is the internet back?" probe
     Installed(String, Installed), // (folder that was checked, result)
 }
 
@@ -516,7 +652,8 @@ fn installed_version(dir: &Path) -> Installed {
     }
 }
 
-fn fetch_latest_tag(repo: &str) -> Option<String> {
+/// Newest release of `repo`: (tag, release notes body).
+fn fetch_latest_release(repo: &str) -> Option<(String, String)> {
     let v: serde_json::Value = ureq::get(&format!("https://api.github.com/repos/{repo}/releases/latest"))
         .set("User-Agent", "akkhara-installer")
         .set("Accept", "application/vnd.github+json")
@@ -525,7 +662,9 @@ fn fetch_latest_tag(repo: &str) -> Option<String> {
         .ok()?
         .into_json()
         .ok()?;
-    v["tag_name"].as_str().map(|s| s.to_string())
+    let tag = v["tag_name"].as_str()?.to_string();
+    let body = v["body"].as_str().unwrap_or("").to_string();
+    Some((tag, body))
 }
 
 #[derive(Clone)]
@@ -534,6 +673,7 @@ enum Page {
     Working,
     Finished,
     Failed(String),
+    Notes, // "What's new" for the available update
 }
 
 struct InstallerApp {
@@ -550,7 +690,10 @@ struct InstallerApp {
     msg_at: Instant,
     logo: Tex,
     msgs: Vec<Tex>,
-    offline_my: Tex,
+    error_imgs: Vec<(&'static str, Tex)>,
+    notes: Option<String>,
+    next_probe: Instant,
+    probing: bool,
     check_tx: Sender<Check>,
     check_rx: Receiver<Check>,
     latest: Option<String>,
@@ -593,7 +736,14 @@ impl InstallerApp {
                 .enumerate()
                 .map(|(i, b)| load_tex(ctx, &format!("msg{i}"), b, 2.0))
                 .collect(),
-            offline_my: load_tex(ctx, "offline_my", OFFLINE_MY_PNG, 2.0),
+            error_imgs: ERROR_IMAGES
+                .iter()
+                .enumerate()
+                .map(|(i, (m, b))| (*m, load_tex(ctx, &format!("err{i}"), b, 2.0)))
+                .collect(),
+            notes: None,
+            next_probe: Instant::now(),
+            probing: false,
         };
         app.check_installed(ctx);
         app.check_latest(ctx);
@@ -618,12 +768,12 @@ impl InstallerApp {
     fn check_latest(&self, ctx: &egui::Context) {
         let (tx, ctx2) = (self.check_tx.clone(), ctx.clone());
         thread::spawn(move || {
-            let _ = tx.send(Check::Latest(fetch_latest_tag(REPO)));
+            let _ = tx.send(Check::Latest(fetch_latest_release(REPO)));
             ctx2.request_repaint();
         });
         let (tx, ctx2) = (self.check_tx.clone(), ctx.clone());
         thread::spawn(move || {
-            let _ = tx.send(Check::InstallerLatest(fetch_latest_tag(INSTALLER_REPO)));
+            let _ = tx.send(Check::InstallerLatest(fetch_latest_release(INSTALLER_REPO).map(|(t, _)| t)));
             ctx2.request_repaint();
         });
     }
@@ -659,6 +809,15 @@ impl InstallerApp {
                 Err(e) => tx.send(Msg::Fail(e)),
             };
         });
+    }
+
+    /// Run the operation that just failed again.
+    fn retry(&mut self) {
+        if self.self_updating {
+            self.start_self_update();
+        } else {
+            self.start(self.uninstalling);
+        }
     }
 
     /// True only when akk is already installed and a newer release exists.
@@ -735,7 +894,8 @@ fn draw_logo(p: &egui::Painter, logo: &Tex, r: Rect) {
 }
 
 fn big_button(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, label: &str) -> bool {
-    let resp = ui.interact(r, ui.id().with(label), Sense::click());
+    // id from the position (not the label) so a changing label never drops a click
+    let resp = ui.interact(r, ui.id().with(("btn", r.min.x as i32, r.min.y as i32)), Sense::click());
     let fill = if resp.is_pointer_button_down_on() {
         Color32::from_rgb(146, 208, 244)
     } else if resp.hovered() {
@@ -770,8 +930,25 @@ impl eframe::App for InstallerApp {
         // ---- results of the version checks
         while let Ok(m) = self.check_rx.try_recv() {
             match m {
-                Check::Latest(tag) => self.latest = tag,
+                Check::Latest(Some((tag, body))) => {
+                    self.latest = Some(tag);
+                    self.notes = Some(clean_notes(&body));
+                }
+                Check::Latest(None) => {
+                    self.latest = None;
+                    self.notes = None;
+                }
                 Check::InstallerLatest(tag) => self.installer_latest = tag,
+                Check::Online(ok) => {
+                    self.probing = false;
+                    self.next_probe = Instant::now() + Duration::from_secs(5);
+                    if ok && matches!(&self.page, Page::Failed(e) if e == OFFLINE_MSG) {
+                        if self.latest.is_none() {
+                            self.check_latest(ctx);
+                        }
+                        self.retry();
+                    }
+                }
                 Check::Installed(dir, state) => {
                     if dir == self.checked_dir {
                         self.installed = Some(state);
@@ -789,8 +966,34 @@ impl eframe::App for InstallerApp {
                         self.target = 1.0;
                         self.done = true;
                     }
-                    Msg::Fail(e) => self.page = Page::Failed(e),
+                    Msg::Fail(e) => {
+                        self.page = Page::Failed(e);
+                        self.next_probe = Instant::now() + Duration::from_secs(5);
+                    }
                 }
+            }
+        }
+
+        // ---- offline: quietly check every few seconds and continue as soon as the internet is back
+        if let Page::Failed(err) = &self.page {
+            if err == OFFLINE_MSG {
+                if !self.probing && Instant::now() >= self.next_probe {
+                    self.probing = true;
+                    let (tx, c) = (self.check_tx.clone(), ctx.clone());
+                    thread::spawn(move || {
+                        let online = match ureq::get("https://api.github.com")
+                            .set("User-Agent", "akkhara-installer")
+                            .timeout(Duration::from_secs(4))
+                            .call()
+                        {
+                            Ok(_) | Err(ureq::Error::Status(..)) => true, // any HTTP answer = we are online
+                            Err(_) => false,
+                        };
+                        let _ = tx.send(Check::Online(online));
+                        c.request_repaint();
+                    });
+                }
+                ctx.request_repaint_after(Duration::from_millis(500));
             }
         }
 
@@ -891,6 +1094,25 @@ impl eframe::App for InstallerApp {
                                 self.start_self_update();
                             } else if !self.dir.trim().is_empty() {
                                 self.start(false);
+                            }
+                        }
+
+                        // "What's new" link (only when an update with release notes exists)
+                        let has_notes = self.notes.as_ref().map(|n| !n.trim().is_empty()).unwrap_or(false);
+                        if self.update_available() && has_notes {
+                            let nr = Rect::from_center_size(o + vec2(556.0, 62.0), vec2(120.0, 22.0));
+                            let nresp = ui.interact(nr, ui.id().with("whatsnew"), Sense::click());
+                            let ncol = if nresp.hovered() { BLUE } else { Color32::from_rgb(20, 60, 100) };
+                            p.text(nr.center(), Align2::CENTER_CENTER, "What's new", FontId::monospace(13.0), ncol);
+                            p.line_segment(
+                                [pos2(nr.min.x + 10.0, nr.max.y - 2.0), pos2(nr.max.x - 10.0, nr.max.y - 2.0)],
+                                Stroke::new(1.5_f32, ncol),
+                            );
+                            if nresp.hovered() {
+                                ctx.set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            if nresp.clicked() {
+                                self.page = Page::Notes;
                             }
                         }
 
@@ -997,11 +1219,13 @@ impl eframe::App for InstallerApp {
                         if err.chars().count() > 260 {
                             text.push_str("...");
                         }
+                        if err == OFFLINE_MSG {
+                            text.push_str("\nRetrying automatically...");
+                        }
                         let galley = p.layout(text, FontId::monospace(13.0), INK, 407.0);
                         p.galley(o + vec2(207.0, 78.0), galley, INK);
-                        if err == OFFLINE_MSG {
-                            let t = &self.offline_my;
-                            let rect = Rect::from_min_size(o + vec2(207.0, 128.0), t.size);
+                        if let Some((_, t)) = self.error_imgs.iter().find(|(m, _)| *m == err.as_str()) {
+                            let rect = Rect::from_min_size(o + vec2(207.0, 130.0), t.size);
                             p.image(
                                 t.handle.id(),
                                 rect,
@@ -1009,9 +1233,33 @@ impl eframe::App for InstallerApp {
                                 Color32::WHITE,
                             );
                         }
-                        if big_button(ui, &p, Rect::from_min_size(o + vec2(207.0, 208.0), vec2(407.0, 50.0)), "Back") {
+                        if big_button(ui, &p, Rect::from_min_size(o + vec2(207.0, 208.0), vec2(150.0, 50.0)), "Back") {
                             self.page = Page::Setup;
                             self.check_installed(ctx);
+                            if self.latest.is_none() {
+                                self.check_latest(ctx);
+                            }
+                        }
+                        if big_button(ui, &p, Rect::from_min_size(o + vec2(367.0, 208.0), vec2(247.0, 50.0)), "Retry") {
+                            self.retry();
+                        }
+                    }
+
+                    // ---------------------------------------------------- what's new
+                    Page::Notes => {
+                        draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(22.0, 17.0), vec2(168.0, 168.0)));
+                        let title = format!("What's new in {}", self.latest.as_deref().unwrap_or("latest"));
+                        heading(&p, o + vec2(0.0, 48.0), &title);
+                        let mut notes = self.notes.clone().unwrap_or_default();
+                        if notes.trim().is_empty() {
+                            notes = "No release notes were provided.".to_string();
+                        }
+                        let mut job = egui::text::LayoutJob::simple(notes, FontId::monospace(13.0), INK, 407.0);
+                        job.wrap.max_rows = 8;
+                        let galley = p.layout_job(job);
+                        p.galley(o + vec2(207.0, 78.0), galley, INK);
+                        if big_button(ui, &p, Rect::from_min_size(o + vec2(207.0, 208.0), vec2(407.0, 50.0)), "Back") {
+                            self.page = Page::Setup;
                         }
                     }
                 }
@@ -1056,4 +1304,43 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(InstallerApp::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const H: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"; // sha256("abc")
+
+    #[test]
+    fn sha256_matches_known_value() {
+        assert_eq!(sha256_hex(b"abc"), H);
+    }
+
+    #[test]
+    fn parses_checksum_formats() {
+        assert_eq!(parse_checksum(&format!("{H}\n"), "x.zip").as_deref(), Some(H));
+        assert_eq!(parse_checksum(&format!("{H}  x.zip\n"), "x.zip").as_deref(), Some(H));
+        assert_eq!(parse_checksum(&format!("{}  y.zip\n{H} *x.zip\n", "0".repeat(64)), "x.zip").as_deref(), Some(H));
+        assert_eq!(parse_checksum(&format!("{}  y.zip\n", "0".repeat(64)), "x.zip"), None);
+        assert_eq!(parse_checksum("not a hash", "x.zip"), None);
+    }
+
+    #[test]
+    fn finds_checksum_asset() {
+        let rel = serde_json::json!({"assets": [
+            {"name": "a.zip", "browser_download_url": "u1"},
+            {"name": "a.zip.sha256", "browser_download_url": "u2"},
+            {"name": "SHA256SUMS", "browser_download_url": "u3"}]});
+        assert_eq!(find_checksum_url(&rel, "a.zip").as_deref(), Some("u2"));
+        assert_eq!(find_checksum_url(&rel, "b.zip").as_deref(), Some("u3"));
+        let none = serde_json::json!({"assets": [{"name": "a.zip", "browser_download_url": "u1"}]});
+        assert_eq!(find_checksum_url(&none, "a.zip"), None);
+    }
+
+    #[test]
+    fn cleans_release_notes() {
+        let md = "## What's new\n- **Faster** `akk` startup\n* See [docs](https://x.y/z)\n\nအသစ်များ\nFull Changelog: https://github.com/a/b";
+        assert_eq!(clean_notes(md), "What's new\n- Faster akk startup\n- See docs");
+    }
 }
