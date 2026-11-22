@@ -24,3 +24,17 @@ and extracts `akk` / `akk.exe` from them.
 ## Notes
 - Mac/Linux installers need `chmod +x` after download. macOS will warn (unsigned) until you sign/notarize.
 - Asset names are defined in `asset_name()` in src/main.rs; keep them in sync with the main repo's release assets.
+
+## UI assets
+- `assets/logo.png` is a **placeholder cropped from the design screenshot**. Replace it with your real (A + က) logo
+  (square PNG, ~450x450 works well); keep the file name.
+- `assets/msg1.png` ... `msg4.png` are the rotating messages on the installing page. egui cannot shape Burmese,
+  so these were pre-rendered with Noto Sans Myanmar + DejaVu Sans Mono. To change a message, re-render the PNG.
+
+## Screens
+Main Menu -> "Akkhara Release" / "Installer release" -> release list (rows: version, age, size, Latest / pre-release)
+-> click a row (Loading...) -> release page (notes + Install / Update + BACK).
+- Akkhara release: Install -> install folder + PATH page -> install that exact version.
+- Installer release: Install replaces this installer with that version, then Restart.
+- Failed loads show the retry icon; click it to try again.
+`assets/about.png` is the pre-rendered Burmese paragraph on the Main Menu.
