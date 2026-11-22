@@ -198,184 +198,41 @@ fn extract_binary(asset: &str, data: &[u8]) -> Result<Vec<u8>, String> {
     Err(format!("`{want}` was not found inside {asset}"))
 }
 
-// ------------------------------------------------- errors, checksums, notes
-
-/// Turn a ureq error into a short message for the error page.
-fn gh_error(e: ureq::Error) -> String {
-    match e {
-        ureq::Error::Transport(t) => match t.kind() {
-            ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Io => {
-                OFFLINE_MSG.to_string()
-            }
-            _ => format!("Network error: {t}"),
-        },
-        ureq::Error::Status(code, resp) => {
-            let limited = code == 429
-                || (code == 403 && resp.header("x-ratelimit-remaining") == Some("0"));
-            if limited {
-                RATE_LIMIT_MSG.to_string()
-            } else if code == 404 {
-                "Not found on GitHub (HTTP 404). The release or file may have been removed.".to_string()
-            } else {
-                format!("GitHub returned an error (HTTP {code}). Please try again later.")
-            }
-        }
-    }
-}
-
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(data))
-}
-
-/// Find the SHA256 for `asset` in a checksum file. Accepts a bare hash,
-/// `<hash>  <file>` (sha256sum) and multi-line SHA256SUMS files.
-fn parse_checksum(text: &str, asset: &str) -> Option<String> {
-    let mut lone = None;
-    for line in text.lines() {
-        let mut it = line.split_whitespace();
-        let Some(hash) = it.next() else { continue };
-        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-            continue;
-        }
-        let hash = hash.to_ascii_lowercase();
-        match it.next() {
-            Some(name) => {
-                let name = name.trim_start_matches('*');
-                if Path::new(name).file_name().and_then(|n| n.to_str()) == Some(asset) {
-                    return Some(hash);
-                }
-            }
-            None => lone = Some(hash),
-        }
-    }
-    lone
-}
-
-/// URL of the checksum file for `asset` in a release: `<asset>.sha256`, or a combined SHA256SUMS file.
-fn find_checksum_url(release: &serde_json::Value, asset: &str) -> Option<String> {
-    let assets = release["assets"].as_array()?;
-    let own = format!("{asset}.sha256");
-    let combined = ["SHA256SUMS", "SHA256SUMS.txt", "sha256sums.txt", "checksums.txt"];
-    let pick = |pred: &dyn Fn(&str) -> bool| {
-        assets
-            .iter()
-            .find(|a| a["name"].as_str().map(pred).unwrap_or(false))
-            .and_then(|a| a["browser_download_url"].as_str())
-            .map(String::from)
-    };
-    pick(&|n| n == own).or_else(|| pick(&|n| combined.contains(&n)))
-}
-
-/// Compare the downloaded bytes with the checksum published in the release.
-fn verify_checksum(release: &serde_json::Value, asset: &str, data: &[u8]) -> Result<(), String> {
-    let Some(url) = find_checksum_url(release, asset) else {
-        return if REQUIRE_CHECKSUM {
-            Err(format!("The release has no SHA256 checksum for {asset}."))
-        } else {
-            Ok(())
-        };
-    };
-    let resp = ureq::get(&url)
+fn download(url: &str, tx: &Sender<Msg>, from: f32, to: f32) -> Result<Vec<u8>, String> {
+    let resp = ureq::get(url)
         .set("User-Agent", "akkhara-installer")
-        .timeout(Duration::from_secs(15))
         .call()
-        .map_err(gh_error)?;
-    let mut text = String::new();
-    resp.into_reader()
-        .take(64 * 1024)
-        .read_to_string(&mut text)
-        .map_err(|_| OFFLINE_MSG.to_string())?;
-    let want = parse_checksum(&text, asset)
-        .ok_or_else(|| format!("Could not read the checksum file for {asset}."))?;
-    if sha256_hex(data) != want {
-        return Err(CHECKSUM_MSG.to_string());
+        .map_err(|e| format!("Download failed: {e}"))?;
+    let total: Option<u64> = resp.header("Content-Length").and_then(|v| v.parse().ok());
+    let mut reader = resp.into_reader().take(300_000_000);
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 32 * 1024];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|e| format!("Download failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(t) = total.filter(|t| *t > 0) {
+            let frac = (buf.len() as f32 / t as f32).min(1.0);
+            let _ = tx.send(Msg::Progress(from + (to - from) * frac));
+        }
     }
-    Ok(())
+    Ok(buf)
 }
 
-/// Release notes (Markdown) -> plain text the installer font can draw.
-/// egui's built-in fonts have no Myanmar glyphs, so non-ASCII characters are dropped.
-fn clean_notes(body: &str) -> String {
-    fn strip_links(s: &str) -> String {
-        let mut out = String::new();
-        let mut it = s.chars().peekable();
-        let mut skip = false;
-        while let Some(c) = it.next() {
-            if skip {
-                if c == ')' {
-                    skip = false;
-                }
-                continue;
-            }
-            if c == ']' && it.peek() == Some(&'(') {
-                it.next();
-                skip = true;
-                continue;
-            }
-            if c == '[' {
-                continue;
-            }
-            out.push(c);
-        }
-        out
-    }
-    let mut lines: Vec<String> = Vec::new();
-    for raw in body.lines() {
-        let t = raw.trim();
-        let bullet = t.starts_with("- ") || t.starts_with("* ");
-        let t = t.trim_start_matches(|c| c == '#' || c == '>' || c == ' ');
-        let t = if bullet { t.trim_start_matches(|c| c == '-' || c == '*' || c == ' ') } else { t };
-        let t = strip_links(t);
-        if t.contains("http") {
-            continue; // bare "Full changelog: https://..." style lines
-        }
-        let t: String = t
-            .chars()
-            .filter(|c| c.is_ascii() && !c.is_ascii_control() && !matches!(c, '*' | '`' | '#'))
-            .collect();
-        let t = t.trim();
-        if t.is_empty() {
-            continue;
-        }
-        lines.push(if bullet { format!("- {t}") } else { t.to_string() });
-    }
-    lines.join("\n")
-}
-
-fn install(dir: PathBuf, add_path: bool, tx: &Sender<Msg>) -> Result<(), String> {
+/// Install the selected akk release: download its archive, unpack `akk`, add to PATH.
+fn install(dir: PathBuf, add_path: bool, url: &str, asset: &str, tx: &Sender<Msg>) -> Result<(), String> {
     let prog = |v: f32| {
         let _ = tx.send(Msg::Progress(v));
     };
-
-    let asset = asset_name().ok_or("This platform is not supported yet.")?;
     prog(0.03);
-
-    let release: serde_json::Value =
-        ureq::get(&format!("https://api.github.com/repos/{REPO}/releases/latest"))
-            .set("User-Agent", "akkhara-installer")
-            .set("Accept", "application/vnd.github+json")
-            .call()
-            .map_err(gh_error)?
-            .into_json()
-            .map_err(|e| e.to_string())?;
-    prog(0.08);
-
-    let tag = release["tag_name"].as_str().unwrap_or("unknown").to_string();
-    let url = release["assets"]
-        .as_array()
-        .and_then(|a| a.iter().find(|x| x["name"] == asset))
-        .and_then(|x| x["browser_download_url"].as_str())
-        .ok_or_else(|| format!("Release {tag} has no asset named {asset}"))?
-        .to_string();
-
-    let buf = download(&url, tx, 0.08, 0.78)?;
+    let buf = download(url, tx, 0.05, 0.8)?;
     if buf.len() < 1024 {
         return Err("Downloaded file looks too small; aborting.".into());
     }
-    prog(0.80);
-
-    verify_checksum(&release, asset, &buf)?;
     prog(0.82);
 
     let exe = extract_binary(asset, &buf)?;
@@ -426,33 +283,291 @@ fn uninstall(dir: PathBuf, tx: &Sender<Msg>) -> Result<(), String> {
     Ok(())
 }
 
+/// Name of this installer's own release asset for the current OS/CPU
+/// (must match the names produced by .github/workflows/release.yml).
+fn installer_asset_name() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => Some("Akkhara-Installer-windows-x86_64.exe"),
+        ("linux", "x86_64") => Some("Akkhara-Installer-linux-x86_64"),
+        ("macos", "aarch64") => Some("Akkhara-Installer-macos-aarch64"),
+        ("macos", "x86_64") => Some("Akkhara-Installer-macos-x86_64"),
+        _ => None,
+    }
+}
+
+/// Replace this running installer with the chosen installer release.
+/// (A running exe can be renamed but not overwritten, so: current -> .old, new -> current.)
+fn self_update(exe: PathBuf, url: &str, tx: &Sender<Msg>) -> Result<(), String> {
+    let prog = |v: f32| {
+        let _ = tx.send(Msg::Progress(v));
+    };
+    prog(0.03);
+    let buf = download(url, tx, 0.05, 0.85)?;
+    if buf.len() < 100_000 {
+        return Err("Downloaded installer looks too small; aborting.".into());
+    }
+
+    let new_path = exe.with_extension("new");
+    let old_path = exe.with_extension("old");
+    fs::write(&new_path, &buf).map_err(|e| format!("Could not write the new installer: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&new_path, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    }
+    prog(0.9);
+
+    let _ = fs::remove_file(&old_path);
+    fs::rename(&exe, &old_path).map_err(|e| format!("Could not replace the installer: {e}"))?;
+    if let Err(e) = fs::rename(&new_path, &exe) {
+        let _ = fs::rename(&old_path, &exe); // roll back
+        return Err(format!("Could not replace the installer: {e}"));
+    }
+    prog(1.0);
+    Ok(())
+}
+
+// ------------------------------------------------------ versions & releases
+
+#[derive(Clone)]
+enum Installed {
+    None,            // no akk in the install folder
+    Unknown,         // akk exists but its version could not be read
+    Version(String), // e.g. "1.1.0"
+}
+
+fn parse_version(text: &str) -> Option<String> {
+    text.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .map(|t| t.trim_matches('.'))
+        .find(|t| {
+            t.contains('.') && t.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(|t| t.to_string())
+}
+
+fn version_nums(v: &str) -> Vec<u64> {
+    v.trim_start_matches('v')
+        .split('.')
+        .map(|p| p.parse().unwrap_or(0))
+        .collect()
+}
+
+fn is_newer(latest: &str, installed: &str) -> bool {
+    let (a, b) = (version_nums(latest), version_nums(installed));
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (*a.get(i).unwrap_or(&0), *b.get(i).unwrap_or(&0));
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
+/// Runs `<dir>/akk --version` and reads the version number from its output.
+fn installed_version(dir: &Path) -> Installed {
+    let bin = dir.join(bin_name());
+    if !bin.exists() {
+        return Installed::None;
+    }
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("--version").stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flash
+    }
+    match cmd.output() {
+        Ok(o) => {
+            let text = format!(
+                "{} {}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            match parse_version(&text) {
+                Some(v) => Installed::Version(v),
+                None => Installed::Unknown,
+            }
+        }
+        Err(_) => Installed::Unknown,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Target {
+    Akkhara,
+    Installer,
+}
+
+impl Target {
+    fn idx(self) -> usize {
+        match self {
+            Target::Akkhara => 0,
+            Target::Installer => 1,
+        }
+    }
+    fn repo(self) -> &'static str {
+        match self {
+            Target::Akkhara => REPO,
+            Target::Installer => INSTALLER_REPO,
+        }
+    }
+    fn title(self) -> &'static str {
+        match self {
+            Target::Akkhara => "Akkhara Release",
+            Target::Installer => "Installer release",
+        }
+    }
+    fn asset(self) -> Option<&'static str> {
+        match self {
+            Target::Akkhara => asset_name(),
+            Target::Installer => installer_asset_name(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Release {
+    tag: String,
+    prerelease: bool,
+    latest: bool,
+    published: Option<i64>, // unix seconds
+    size: Option<u64>,      // bytes of the file for this OS/CPU
+    url: Option<String>,    // download URL of that file
+    body: String,           // release notes (markdown)
+}
+
+enum Load<T> {
+    Idle,
+    Loading,
+    Done(T),
+    Error,
+}
+
+enum Check {
+    Installed(String, Installed), // (folder that was checked, result)
+    List(Target, Result<Vec<Release>, String>),
+    Detail(Target, String, Result<Release, String>),
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// "2026-11-15T10:20:30Z" -> unix seconds
+fn iso_to_unix(s: &str) -> Option<i64> {
+    let n = |a: usize, b: usize| s.get(a..b)?.parse::<i64>().ok();
+    let (y, mo, d) = (n(0, 4)?, n(5, 7)?, n(8, 10)?);
+    let (h, mi, se) = (n(11, 13)?, n(14, 16)?, n(17, 19)?);
+    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se)
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn ago(published: i64) -> String {
+    let s = (now_secs() - published).max(0);
+    let plural = |n: i64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
+    match s {
+        0..=59 => "Just now".to_string(),
+        60..=3599 => plural(s / 60, "min"),
+        3600..=86_399 => plural(s / 3600, "hour"),
+        86_400..=172_799 => "Yesterday".to_string(),
+        172_800..=604_799 => plural(s / 86_400, "day"),
+        604_800..=1_209_599 => "Last week".to_string(),
+        1_209_600..=2_591_999 => plural(s / 604_800, "week"),
+        2_592_000..=5_183_999 => "Last month".to_string(),
+        5_184_000..=31_535_999 => plural(s / 2_592_000, "month"),
+        _ => plural(s / 31_536_000, "year"),
+    }
+}
+
+fn size_label(bytes: u64) -> String {
+    format!("{:.2}MB", bytes as f64 / 1_048_576.0)
+}
+
+fn parse_release(v: &serde_json::Value, asset: Option<&str>) -> Release {
+    let a = asset.and_then(|n| {
+        v["assets"]
+            .as_array()
+            .and_then(|arr| arr.iter().find(|x| x["name"] == n))
+    });
+    Release {
+        tag: v["tag_name"].as_str().unwrap_or("?").to_string(),
+        prerelease: v["prerelease"].as_bool().unwrap_or(false),
+        latest: false,
+        published: v["published_at"].as_str().and_then(iso_to_unix),
+        size: a.and_then(|x| x["size"].as_u64()),
+        url: a
+            .and_then(|x| x["browser_download_url"].as_str())
+            .map(|s| s.to_string()),
+        body: v["body"].as_str().unwrap_or("").to_string(),
+    }
+}
+
+fn github_get(path: &str) -> Result<serde_json::Value, String> {
+    ureq::get(&format!("https://api.github.com/repos/{path}"))
+        .set("User-Agent", "akkhara-installer")
+        .set("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(12))
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_json()
+        .map_err(|e| e.to_string())
+}
+
+fn load_releases(t: Target) -> Result<Vec<Release>, String> {
+    let v = github_get(&format!("{}/releases?per_page=30", t.repo()))?;
+    let arr = v.as_array().ok_or("unexpected response")?;
+    let mut out: Vec<Release> = arr
+        .iter()
+        .filter(|x| !x["draft"].as_bool().unwrap_or(false))
+        .map(|x| parse_release(x, t.asset()))
+        .collect();
+    if let Some(first) = out.iter_mut().find(|r| !r.prerelease) {
+        first.latest = true;
+    }
+    Ok(out)
+}
+
+fn load_release(t: Target, tag: &str) -> Result<Release, String> {
+    let v = github_get(&format!("{}/releases/tags/{}", t.repo(), tag))?;
+    Ok(parse_release(&v, t.asset()))
+}
+
 // ---------------------------------------------------------------------- UI
 
 const CARD: Color32 = Color32::from_rgb(118, 169, 199);
 const LIGHT: Color32 = Color32::from_rgb(184, 229, 255);
 const BLUE: Color32 = Color32::from_rgb(29, 91, 194);
 const INK: Color32 = Color32::BLACK;
+const ROW: Color32 = Color32::from_rgb(133, 205, 247);
+const GREY: Color32 = Color32::from_rgb(85, 85, 85);
+const PURPLE: Color32 = Color32::from_rgb(46, 14, 140);
+const LILAC: Color32 = Color32::from_rgb(200, 172, 255);
+const GREEN_BG: Color32 = Color32::from_rgb(38, 94, 14);
+const GREEN_FG: Color32 = Color32::from_rgb(126, 206, 32);
+const GOLD_BG: Color32 = Color32::from_rgb(172, 138, 1);
+const GOLD_FG: Color32 = Color32::from_rgb(255, 230, 120);
+const ERR_RED: Color32 = Color32::from_rgb(248, 101, 103);
+const TRACK: Color32 = Color32::from_rgb(118, 169, 199);
+const THUMB: Color32 = Color32::from_rgb(75, 125, 153);
 
-const WIN_W: f32 = 660.0;
-const WIN_H: f32 = 280.0;
+const MENU_W: f32 = 700.0; // menu, release lists, release page
+const MENU_H: f32 = 384.0;
+const SETUP_W: f32 = 660.0; // install folder, progress, finished
+const SETUP_H: f32 = 280.0;
 
 const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
-// ---- error messages
-// Each of these has a pre-rendered Myanmar version (egui cannot shape Burmese text, so the
-// Myanmar lines are PNG images, like the install-screen messages). The error page looks the
-// image up by comparing the message text, so keep the strings and ERROR_IMAGES in sync.
-const OFFLINE_MSG: &str = "No internet connection. Please check your network and try again.";
-const RATE_LIMIT_MSG: &str = "GitHub rate limit reached. Please wait a few minutes and try again.";
-const CHECKSUM_MSG: &str = "Checksum mismatch: the downloaded file may be corrupted. Please try again.";
-const ERROR_IMAGES: [(&str, &[u8]); 3] = [
-    (OFFLINE_MSG, include_bytes!("../assets/offline_my.png")),
-    (RATE_LIMIT_MSG, include_bytes!("../assets/rate_limit_my.png")),
-    (CHECKSUM_MSG, include_bytes!("../assets/checksum_my.png")),
-];
-
-/// Set to true to refuse installs when the release has no SHA256 checksum file.
-/// (false = verify when a checksum is published, otherwise continue.)
-const REQUIRE_CHECKSUM: bool = false;
+const ABOUT_PNG: &[u8] = include_bytes!("../assets/about.png");
 // Pre-rendered with proper Myanmar text shaping (egui cannot shape Burmese itself).
 const MESSAGE_PNGS: [&[u8]; 4] = [
     include_bytes!("../assets/msg1.png"),
@@ -490,219 +605,46 @@ fn next_index(cur: usize, n: usize) -> usize {
     i
 }
 
-/// Name of this installer's own release asset for the current OS/CPU
-/// (must match the names produced by .github/workflows/release.yml).
-fn installer_asset_name() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", "x86_64") => Some("Akkhara-Installer-windows-x86_64.exe"),
-        ("linux", "x86_64") => Some("Akkhara-Installer-linux-x86_64"),
-        ("macos", "aarch64") => Some("Akkhara-Installer-macos-aarch64"),
-        ("macos", "x86_64") => Some("Akkhara-Installer-macos-x86_64"),
-        _ => None,
-    }
-}
-
-fn download(url: &str, tx: &Sender<Msg>, from: f32, to: f32) -> Result<Vec<u8>, String> {
-    let resp = ureq::get(url)
-        .set("User-Agent", "akkhara-installer")
-        .call()
-        .map_err(gh_error)?;
-    let total: Option<u64> = resp.header("Content-Length").and_then(|v| v.parse().ok());
-    let mut reader = resp.into_reader().take(300_000_000);
-    let mut buf = Vec::new();
-    let mut chunk = vec![0u8; 32 * 1024];
-    loop {
-        // a read error half-way through almost always means the connection dropped
-        let n = reader.read(&mut chunk).map_err(|_| OFFLINE_MSG.to_string())?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(t) = total.filter(|t| *t > 0) {
-            let frac = (buf.len() as f32 / t as f32).min(1.0);
-            let _ = tx.send(Msg::Progress(from + (to - from) * frac));
-        }
-    }
-    Ok(buf)
-}
-
-/// Replace this running installer with the newest one from the installer repo.
-/// (A running exe can be renamed but not overwritten, so: current -> .old, new -> current.)
-fn self_update(exe: PathBuf, tx: &Sender<Msg>) -> Result<(), String> {
-    let prog = |v: f32| {
-        let _ = tx.send(Msg::Progress(v));
-    };
-    let asset = installer_asset_name().ok_or("This platform is not supported yet.")?;
-    prog(0.03);
-
-    let release: serde_json::Value =
-        ureq::get(&format!("https://api.github.com/repos/{INSTALLER_REPO}/releases/latest"))
-            .set("User-Agent", "akkhara-installer")
-            .set("Accept", "application/vnd.github+json")
-            .call()
-            .map_err(gh_error)?
-            .into_json()
-            .map_err(|e| e.to_string())?;
-    prog(0.08);
-
-    let tag = release["tag_name"].as_str().unwrap_or("unknown").to_string();
-    let url = release["assets"]
-        .as_array()
-        .and_then(|a| a.iter().find(|x| x["name"] == asset))
-        .and_then(|x| x["browser_download_url"].as_str())
-        .ok_or_else(|| format!("Installer release {tag} has no asset named {asset}"))?
-        .to_string();
-
-    let buf = download(&url, tx, 0.08, 0.85)?;
-    if buf.len() < 100_000 {
-        return Err("Downloaded installer looks too small; aborting.".into());
-    }
-    verify_checksum(&release, asset, &buf)?;
-
-    let new_path = exe.with_extension("new");
-    let old_path = exe.with_extension("old");
-    fs::write(&new_path, &buf).map_err(|e| format!("Could not write the new installer: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&new_path, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
-    }
-    prog(0.9);
-
-    let _ = fs::remove_file(&old_path);
-    fs::rename(&exe, &old_path).map_err(|e| format!("Could not replace the installer: {e}"))?;
-    if let Err(e) = fs::rename(&new_path, &exe) {
-        let _ = fs::rename(&old_path, &exe); // roll back
-        return Err(format!("Could not replace the installer: {e}"));
-    }
-    prog(1.0);
-    Ok(())
-}
-
-// ------------------------------------------------------- update checking
-
-#[derive(Clone)]
-enum Installed {
-    None,            // no akk in the install folder
-    Unknown,         // akk exists but its version could not be read
-    Version(String), // e.g. "1.1.0"
-}
-
-enum Check {
-    Latest(Option<(String, String)>), // (tag, release notes)
-    InstallerLatest(Option<String>),
-    Online(bool),                     // result of the "is the internet back?" probe
-    Installed(String, Installed), // (folder that was checked, result)
-}
-
-fn parse_version(text: &str) -> Option<String> {
-    text.split(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .map(|t| t.trim_matches('.'))
-        .find(|t| {
-            t.contains('.') && t.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-        })
-        .map(|t| t.to_string())
-}
-
-fn version_nums(v: &str) -> Vec<u64> {
-    v.trim_start_matches('v')
-        .split('.')
-        .map(|p| p.parse().unwrap_or(0))
-        .collect()
-}
-
-fn is_newer(latest: &str, installed: &str) -> bool {
-    let (a, b) = (version_nums(latest), version_nums(installed));
-    for i in 0..a.len().max(b.len()) {
-        let (x, y) = (*a.get(i).unwrap_or(&0), *b.get(i).unwrap_or(&0));
-        if x != y {
-            return x > y;
-        }
-    }
-    false
-}
-
-/// Runs `<dir>/akk --version` and reads the version number from its output.
-fn installed_version(dir: &Path) -> Installed {
-    let bin = dir.join(bin_name());
-    if !bin.exists() {
-        return Installed::None;
-    }
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.arg("--version")
-        .stdin(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flash
-    }
-    match cmd.output() {
-        Ok(o) => {
-            let text = format!(
-                "{} {}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            );
-            match parse_version(&text) {
-                Some(v) => Installed::Version(v),
-                None => Installed::Unknown,
-            }
-        }
-        Err(_) => Installed::Unknown,
-    }
-}
-
-/// Newest release of `repo`: (tag, release notes body).
-fn fetch_latest_release(repo: &str) -> Option<(String, String)> {
-    let v: serde_json::Value = ureq::get(&format!("https://api.github.com/repos/{repo}/releases/latest"))
-        .set("User-Agent", "akkhara-installer")
-        .set("Accept", "application/vnd.github+json")
-        .timeout(Duration::from_secs(10))
-        .call()
-        .ok()?
-        .into_json()
-        .ok()?;
-    let tag = v["tag_name"].as_str()?.to_string();
-    let body = v["body"].as_str().unwrap_or("").to_string();
-    Some((tag, body))
-}
-
 #[derive(Clone)]
 enum Page {
-    Setup,
-    Working,
+    Menu,           // main menu
+    List,           // release list of `target`
+    Open,           // loading / failed while opening one release
+    Detail,         // one release: notes + Install
+    Setup,          // install folder + PATH
+    Working,        // progress
     Finished,
-    Failed(String),
-    Notes, // "What's new" for the available update
+    Failed(String), // install / update error
 }
 
 struct InstallerApp {
     page: Page,
+    target: Target,
+    lists: [Load<Vec<Release>>; 2],
+    detail: Load<Release>,
+    sel_tag: String,
+    chosen: Option<Release>,
     dir: String,
     add_path: bool,
     uninstalling: bool,
+    updating: bool,
+    self_updating: bool,
     rx: Option<Receiver<Msg>>,
-    target: f32,
+    goal: f32,
     shown: f32,
     done: bool,
     started: Instant,
     msg_idx: usize,
     msg_at: Instant,
     logo: Tex,
+    about: Tex,
     msgs: Vec<Tex>,
-    error_imgs: Vec<(&'static str, Tex)>,
-    notes: Option<String>,
-    next_probe: Instant,
-    probing: bool,
     check_tx: Sender<Check>,
     check_rx: Receiver<Check>,
-    latest: Option<String>,
-    installer_latest: Option<String>,
-    self_updating: bool,
-    exe_path: Option<PathBuf>,
     installed: Option<Installed>,
     checked_dir: String,
-    updating: bool,
+    exe_path: Option<PathBuf>,
+    win_size: egui::Vec2,
 }
 
 impl InstallerApp {
@@ -710,44 +652,47 @@ impl InstallerApp {
         let ctx = &cc.egui_ctx;
         let (check_tx, check_rx) = channel();
         let mut app = Self {
-            check_tx,
-            check_rx,
-            latest: None,
-            installer_latest: None,
-            self_updating: false,
-            exe_path: std::env::current_exe().ok(),
-            installed: None,
-            checked_dir: String::new(),
-            updating: false,
-            page: Page::Setup,
+            page: Page::Menu,
+            target: Target::Akkhara,
+            lists: [Load::Idle, Load::Idle],
+            detail: Load::Idle,
+            sel_tag: String::new(),
+            chosen: None,
             dir: default_dir().to_string_lossy().to_string(),
             add_path: true,
             uninstalling: false,
+            updating: false,
+            self_updating: false,
             rx: None,
-            target: 0.0,
+            goal: 0.0,
             shown: 0.0,
             done: false,
             started: Instant::now(),
             msg_idx: next_index(usize::MAX, MESSAGE_PNGS.len()),
             msg_at: Instant::now(),
             logo: load_tex(ctx, "logo", LOGO_PNG, 1.0),
+            about: load_tex(ctx, "about", ABOUT_PNG, 2.0),
             msgs: MESSAGE_PNGS
                 .iter()
                 .enumerate()
                 .map(|(i, b)| load_tex(ctx, &format!("msg{i}"), b, 2.0))
                 .collect(),
-            error_imgs: ERROR_IMAGES
-                .iter()
-                .enumerate()
-                .map(|(i, (m, b))| (*m, load_tex(ctx, &format!("err{i}"), b, 2.0)))
-                .collect(),
-            notes: None,
-            next_probe: Instant::now(),
-            probing: false,
+            check_tx,
+            check_rx,
+            installed: None,
+            checked_dir: String::new(),
+            exe_path: std::env::current_exe().ok(),
+            win_size: vec2(MENU_W, MENU_H),
         };
         app.check_installed(ctx);
-        app.check_latest(ctx);
         app
+    }
+
+    fn page_size(&self) -> egui::Vec2 {
+        match &self.page {
+            Page::Menu | Page::List | Page::Open | Page::Detail => vec2(MENU_W, MENU_H),
+            _ => vec2(SETUP_W, SETUP_H),
+        }
     }
 
     /// Look at the install folder in the background (is akk there, and which version?).
@@ -764,93 +709,108 @@ impl InstallerApp {
         });
     }
 
-    /// Ask GitHub for the newest release tag in the background.
-    fn check_latest(&self, ctx: &egui::Context) {
-        let (tx, ctx2) = (self.check_tx.clone(), ctx.clone());
+    fn fetch_list(&mut self, ctx: &egui::Context, t: Target) {
+        self.lists[t.idx()] = Load::Loading;
+        let tx = self.check_tx.clone();
+        let ctx = ctx.clone();
         thread::spawn(move || {
-            let _ = tx.send(Check::Latest(fetch_latest_release(REPO)));
-            ctx2.request_repaint();
-        });
-        let (tx, ctx2) = (self.check_tx.clone(), ctx.clone());
-        thread::spawn(move || {
-            let _ = tx.send(Check::InstallerLatest(fetch_latest_release(INSTALLER_REPO).map(|(t, _)| t)));
-            ctx2.request_repaint();
+            let _ = tx.send(Check::List(t, load_releases(t)));
+            ctx.request_repaint();
         });
     }
 
-    /// True when a newer installer release exists than the one running now.
-    fn installer_update_available(&self) -> bool {
-        self.installer_latest
-            .as_deref()
-            .map(|l| is_newer(l, INSTALLER_VERSION))
-            .unwrap_or(false)
+    fn open_list(&mut self, ctx: &egui::Context, t: Target) {
+        self.target = t;
+        self.page = Page::List;
+        if !matches!(self.lists[t.idx()], Load::Done(_)) {
+            self.fetch_list(ctx, t);
+        }
     }
 
-    fn start_self_update(&mut self) {
-        let Some(exe) = self.exe_path.clone() else {
-            self.page = Page::Failed("Could not find the installer's own file.".into());
-            return;
-        };
-        let (tx, rx) = channel();
-        self.rx = Some(rx);
-        self.self_updating = true;
-        self.uninstalling = false;
-        self.updating = false;
+    fn fetch_detail(&mut self, ctx: &egui::Context) {
+        self.detail = Load::Loading;
+        let (t, tag) = (self.target, self.sel_tag.clone());
+        let tx = self.check_tx.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let r = load_release(t, &tag);
+            let _ = tx.send(Check::Detail(t, tag, r));
+            ctx.request_repaint();
+        });
+    }
+
+    fn open_release(&mut self, ctx: &egui::Context, tag: String) {
+        self.sel_tag = tag;
+        self.page = Page::Open;
+        self.fetch_detail(ctx);
+    }
+
+    /// "Update" when akk is installed and this release is newer than it, else "Install".
+    fn akk_label(&self, tag: &str) -> &'static str {
+        match &self.installed {
+            Some(Installed::Version(v)) if is_newer(tag, v) => "Update",
+            _ => "Install",
+        }
+    }
+
+    fn reset_progress(&mut self) {
         self.page = Page::Working;
-        self.target = 0.0;
+        self.goal = 0.0;
         self.shown = 0.0;
         self.done = false;
         self.started = Instant::now();
         self.msg_at = Instant::now();
         self.msg_idx = next_index(usize::MAX, self.msgs.len());
+    }
+
+    fn start(&mut self, remove: bool) {
+        let source = if remove {
+            None
+        } else {
+            match (self.chosen.as_ref().and_then(|r| r.url.clone()), asset_name()) {
+                (Some(u), Some(a)) => Some((u, a.to_string())),
+                _ => {
+                    self.page = Page::Failed("This release has no download for your system.".into());
+                    return;
+                }
+            }
+        };
+        let tag = self.chosen.as_ref().map(|r| r.tag.clone()).unwrap_or_default();
+        self.updating = !remove && self.akk_label(&tag) == "Update";
+        self.uninstalling = remove;
+        self.self_updating = false;
+        self.reset_progress();
+
+        let (tx, rx) = channel();
+        self.rx = Some(rx);
+        let dir = PathBuf::from(self.dir.trim());
+        let add_path = self.add_path;
         thread::spawn(move || {
-            let _ = match self_update(exe, &tx) {
+            let result = match source {
+                None => uninstall(dir, &tx),
+                Some((url, asset)) => install(dir, add_path, &url, &asset, &tx),
+            };
+            let _ = match result {
                 Ok(()) => tx.send(Msg::Done),
                 Err(e) => tx.send(Msg::Fail(e)),
             };
         });
     }
 
-    /// Run the operation that just failed again.
-    fn retry(&mut self) {
-        if self.self_updating {
-            self.start_self_update();
-        } else {
-            self.start(self.uninstalling);
-        }
-    }
-
-    /// True only when akk is already installed and a newer release exists.
-    fn update_available(&self) -> bool {
-        match (&self.installed, &self.latest) {
-            (Some(Installed::Version(v)), Some(l)) => is_newer(l, v),
-            (Some(Installed::Unknown), Some(_)) => true,
-            _ => false,
-        }
-    }
-
-    fn start(&mut self, remove: bool) {
-        self.updating = !remove && self.update_available();
+    fn start_self_update(&mut self) {
+        let url = self.chosen.as_ref().and_then(|r| r.url.clone());
+        let (Some(exe), Some(url)) = (self.exe_path.clone(), url) else {
+            self.page = Page::Failed("This installer release has no download for your system.".into());
+            return;
+        };
+        self.self_updating = true;
+        self.uninstalling = false;
+        self.updating = false;
+        self.reset_progress();
         let (tx, rx) = channel();
         self.rx = Some(rx);
-        self.uninstalling = remove;
-        self.self_updating = false;
-        self.page = Page::Working;
-        self.target = 0.0;
-        self.shown = 0.0;
-        self.done = false;
-        self.started = Instant::now();
-        self.msg_at = Instant::now();
-        self.msg_idx = next_index(usize::MAX, self.msgs.len());
-        let dir = PathBuf::from(self.dir.trim());
-        let add_path = self.add_path;
         thread::spawn(move || {
-            let result = if remove {
-                uninstall(dir, &tx)
-            } else {
-                install(dir, add_path, &tx)
-            };
-            let _ = match result {
+            let _ = match self_update(exe, &url, &tx) {
                 Ok(()) => tx.send(Msg::Done),
                 Err(e) => tx.send(Msg::Fail(e)),
             };
@@ -860,8 +820,12 @@ impl InstallerApp {
 
 // ---- drawing helpers
 
+fn box_with(p: &egui::Painter, r: Rect, radius: f32, fill: Color32, w: f32, stroke: Color32) {
+    p.rect(r.shrink(w / 2.0), radius, fill, Stroke::new(w, stroke));
+}
+
 fn thick_box(p: &egui::Painter, r: Rect, radius: f32, fill: Color32, w: f32) {
-    p.rect(r.shrink(w / 2.0), radius, fill, Stroke::new(w, INK));
+    box_with(p, r, radius, fill, w, INK);
 }
 
 fn rounded_path(r: Rect, rad: f32) -> Vec<Pos2> {
@@ -894,8 +858,7 @@ fn draw_logo(p: &egui::Painter, logo: &Tex, r: Rect) {
 }
 
 fn big_button(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, label: &str) -> bool {
-    // id from the position (not the label) so a changing label never drops a click
-    let resp = ui.interact(r, ui.id().with(("btn", r.min.x as i32, r.min.y as i32)), Sense::click());
+    let resp = ui.interact(r, ui.id().with(label), Sense::click());
     let fill = if resp.is_pointer_button_down_on() {
         Color32::from_rgb(146, 208, 244)
     } else if resp.hovered() {
@@ -905,6 +868,24 @@ fn big_button(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, label: &str) -> boo
     };
     thick_box(p, r, 24.0, fill, 6.0);
     p.text(r.center(), Align2::CENTER_CENTER, label, FontId::monospace(20.0), INK);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    resp.clicked()
+}
+
+/// Grey-bordered blue-text button (menu, BACK, Install on the release page).
+fn menu_button(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, label: &str, size: f32) -> bool {
+    let resp = ui.interact(r, ui.id().with(("mb", label)), Sense::click());
+    let fill = if resp.is_pointer_button_down_on() {
+        Color32::from_rgb(110, 188, 236)
+    } else if resp.hovered() {
+        Color32::from_rgb(160, 220, 252)
+    } else {
+        ROW
+    };
+    box_with(p, r, 16.0, fill, 5.0, GREY);
+    p.text(r.center(), Align2::CENTER_CENTER, label, FontId::monospace(size), BLUE);
     if resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
@@ -921,85 +902,312 @@ fn heading(p: &egui::Painter, origin: Pos2, text: &str) {
     );
 }
 
+/// Underlined page title.
+fn title(p: &egui::Painter, pos: Pos2, text: &str, size: f32) {
+    let r = p.text(pos, Align2::LEFT_CENTER, text, FontId::monospace(size), INK);
+    p.line_segment(
+        [r.left_bottom() + vec2(0.0, 1.0), r.right_bottom() + vec2(0.0, 1.0)],
+        Stroke::new(2.0_f32, INK),
+    );
+}
+
+fn pill_width(p: &egui::Painter, text: &str, size: f32) -> f32 {
+    p.layout_no_wrap(text.to_string(), FontId::monospace(size), INK).size().x + 22.0
+}
+
+/// Rounded label starting at `pos` (vertically centred on pos.y). Returns its width.
+fn pill(p: &egui::Painter, pos: Pos2, text: &str, bg: Color32, fg: Color32, size: f32) -> f32 {
+    let w = pill_width(p, text, size);
+    let r = Rect::from_min_size(pos2(pos.x, pos.y - 14.0), vec2(w, 28.0));
+    p.rect_filled(r, 10.0, bg);
+    p.text(r.center(), Align2::CENTER_CENTER, text, FontId::monospace(size), fg);
+    w
+}
+
+/// White text with a dark outline (the size label in the release rows).
+fn outlined_text(p: &egui::Painter, pos: Pos2, text: &str, size: f32) {
+    let font = FontId::monospace(size);
+    let dark = Color32::from_rgb(80, 80, 90);
+    for d in [vec2(-1.5, 0.0), vec2(1.5, 0.0), vec2(0.0, -1.5), vec2(0.0, 1.5), vec2(1.5, 1.5)] {
+        p.text(pos + d, Align2::LEFT_CENTER, text, font.clone(), dark);
+    }
+    p.text(pos, Align2::LEFT_CENTER, text, font, Color32::WHITE);
+}
+
+/// One release row: version, age, size and Latest / pre-release badge.
+fn draw_release_row(p: &egui::Painter, rect: Rect, r: &Release, hover: bool) {
+    let fill = if hover { Color32::from_rgb(160, 220, 252) } else { ROW };
+    box_with(p, rect, 14.0, fill, 5.0, GREY);
+    let cy = rect.center().y;
+    let vr = p.text(pos2(rect.min.x + 22.0, cy), Align2::LEFT_CENTER, &r.tag, FontId::monospace(17.0), BLUE);
+    let mut x = vr.max.x + 14.0;
+    if let Some(ts) = r.published {
+        x += pill(p, pos2(x, cy), &ago(ts), PURPLE, LILAC, 13.0) + 20.0;
+    }
+    let size = r.size.map(size_label).unwrap_or_else(|| "-".to_string());
+    outlined_text(p, pos2(x, cy), &size, 16.0);
+
+    let badge = if r.latest {
+        Some(("Latest", GREEN_BG, GREEN_FG))
+    } else if r.prerelease {
+        Some(("pre-release", GOLD_BG, GOLD_FG))
+    } else {
+        None
+    };
+    if let Some((t, bg, fg)) = badge {
+        let w = pill_width(p, t, 13.0);
+        pill(p, pos2(rect.max.x - 16.0 - w, cy), t, bg, fg, 13.0);
+    }
+}
+
+fn scroll_thumb<R>(p: &egui::Painter, panel: Rect, out: &egui::scroll_area::ScrollAreaOutput<R>) {
+    let view_h = out.inner_rect.height();
+    let content_h = out.content_size.y;
+    if content_h <= view_h + 1.0 {
+        return;
+    }
+    let track = Rect::from_min_max(
+        pos2(panel.max.x - 30.0, panel.min.y + 14.0),
+        pos2(panel.max.x - 17.0, panel.max.y - 14.0),
+    );
+    p.rect_filled(track, 7.0, TRACK);
+    let th = (track.height() * view_h / content_h).clamp(36.0, track.height());
+    let t = (out.state.offset.y / (content_h - view_h)).clamp(0.0, 1.0);
+    let y = track.min.y + t * (track.height() - th);
+    p.rect_filled(Rect::from_min_size(pos2(track.min.x, y), vec2(track.width(), th)), 7.0, THUMB);
+}
+
+/// Scrollable list of release rows inside `panel`. Returns the tag that was clicked.
+fn release_list(ui: &mut egui::Ui, p: &egui::Painter, panel: Rect, rels: &[Release], key: usize) -> Option<String> {
+    let view = Rect::from_min_max(
+        panel.min + vec2(12.0, 12.0),
+        pos2(panel.max.x - 40.0, panel.max.y - 12.0),
+    );
+    let mut clicked = None;
+    let out = ui
+        .allocate_new_ui(egui::UiBuilder::new().max_rect(view), |ui| {
+            ui.push_id(("rel_list", key), |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 12.0;
+                        for r in rels {
+                            let (rect, resp) = ui.allocate_exact_size(vec2(view.width(), 61.0), Sense::click());
+                            draw_release_row(ui.painter(), rect, r, resp.hovered());
+                            if resp.hovered() {
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            if resp.clicked() {
+                                clicked = Some(r.tag.clone());
+                            }
+                        }
+                    })
+            })
+            .inner
+        })
+        .inner;
+    scroll_thumb(p, panel, &out);
+    clicked
+}
+
+fn loading_view(p: &egui::Painter, panel: Rect) {
+    p.text(panel.center(), Align2::CENTER_CENTER, "Loading...", FontId::monospace(28.0), INK);
+}
+
+/// Circular-arrow retry icon + red message. Returns true when the icon is clicked.
+fn error_view(ui: &mut egui::Ui, p: &egui::Painter, panel: Rect) -> bool {
+    let c = panel.center() + vec2(0.0, -28.0);
+    let resp = ui.interact(
+        Rect::from_center_size(c, vec2(84.0, 84.0)),
+        ui.id().with("retry"),
+        Sense::click(),
+    );
+    let col = if resp.hovered() { BLUE } else { INK };
+    let (radius, sweep, n) = (32.0_f32, 300.0_f32, 40);
+    let pts: Vec<Pos2> = (0..=n)
+        .map(|i| {
+            let a = (sweep * i as f32 / n as f32).to_radians();
+            c + vec2(a.cos(), a.sin()) * radius
+        })
+        .collect();
+    let end = pts[pts.len() - 1];
+    p.add(egui::Shape::line(pts, Stroke::new(5.0_f32, col)));
+    let a = sweep.to_radians();
+    let tan = vec2(-a.sin(), a.cos()); // clockwise direction at the arc's end
+    for ang in [150.0_f32, -150.0] {
+        let r = ang.to_radians();
+        let d = vec2(tan.x * r.cos() - tan.y * r.sin(), tan.x * r.sin() + tan.y * r.cos());
+        p.line_segment([end, end + d * 13.0], Stroke::new(5.0_f32, col));
+    }
+    p.text(panel.center() + vec2(0.0, 40.0), Align2::CENTER_CENTER, "Something went wrong!!", FontId::monospace(14.0), ERR_RED);
+    p.text(panel.center() + vec2(0.0, 62.0), Align2::CENTER_CENTER, "please try again..", FontId::monospace(14.0), ERR_RED);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    resp.clicked()
+}
+
+// ---- tiny markdown renderer for release notes
+
+fn clean_inline(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '*' || c == '`' {
+            i += 1;
+            continue;
+        }
+        if c == '_' && chars.get(i + 1) == Some(&'_') {
+            i += 2;
+            continue;
+        }
+        if c == '[' {
+            if let Some(close) = chars[i..].iter().position(|&x| x == ']') {
+                let j = i + close;
+                if chars.get(j + 1) == Some(&'(') {
+                    if let Some(pc) = chars[j..].iter().position(|&x| x == ')') {
+                        out.extend(chars[i + 1..j].iter());
+                        i = j + pc + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+fn render_markdown(ui: &mut egui::Ui, text: &str) {
+    if text.trim().is_empty() {
+        ui.label(egui::RichText::new("No release notes.").monospace().size(14.0));
+        return;
+    }
+    let mut in_code = false;
+    for line in text.lines() {
+        let t = line.trim_end();
+        let tt = t.trim_start();
+        if tt.starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            ui.label(
+                egui::RichText::new(t)
+                    .monospace()
+                    .size(12.0)
+                    .background_color(Color32::from_rgb(160, 215, 245)),
+            );
+            continue;
+        }
+        if tt.is_empty() {
+            ui.add_space(6.0);
+        } else if let Some(h) = tt.strip_prefix("### ") {
+            ui.label(egui::RichText::new(clean_inline(h)).monospace().strong().size(15.0));
+        } else if let Some(h) = tt.strip_prefix("## ") {
+            ui.label(egui::RichText::new(clean_inline(h)).monospace().strong().size(17.0));
+        } else if let Some(h) = tt.strip_prefix("# ") {
+            ui.label(egui::RichText::new(clean_inline(h)).monospace().strong().size(20.0));
+        } else if let Some(b) = tt.strip_prefix("- ").or_else(|| tt.strip_prefix("* ")) {
+            ui.label(egui::RichText::new(format!("•  {}", clean_inline(b))).monospace().size(13.0));
+        } else {
+            ui.label(egui::RichText::new(clean_inline(tt)).monospace().size(13.0));
+        }
+    }
+}
+
+fn markdown_view(ui: &mut egui::Ui, p: &egui::Painter, panel: Rect, body: &str, key: &str) {
+    let view = Rect::from_min_max(
+        panel.min + vec2(16.0, 12.0),
+        pos2(panel.max.x - 40.0, panel.max.y - 12.0),
+    );
+    let out = ui
+        .allocate_new_ui(egui::UiBuilder::new().max_rect(view), |ui| {
+            ui.push_id(("notes", key), |ui| {
+                ui.style_mut().visuals.override_text_color = Some(INK);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        ui.set_width(view.width());
+                        render_markdown(ui, body);
+                    })
+            })
+            .inner
+        })
+        .inner;
+    scroll_thumb(p, panel, &out);
+}
+
 impl eframe::App for InstallerApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         egui::Rgba::TRANSPARENT.to_array()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ---- results of the version checks
+        // ---- window size follows the page (the menu/release pages are bigger)
+        let want = self.page_size();
+        if (self.win_size - want).length() > 0.5 {
+            self.win_size = want;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(vec2(100.0, 100.0)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(vec2(2000.0, 2000.0)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(want));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(want));
+        }
+
+        // ---- results of background lookups
         while let Ok(m) = self.check_rx.try_recv() {
             match m {
-                Check::Latest(Some((tag, body))) => {
-                    self.latest = Some(tag);
-                    self.notes = Some(clean_notes(&body));
-                }
-                Check::Latest(None) => {
-                    self.latest = None;
-                    self.notes = None;
-                }
-                Check::InstallerLatest(tag) => self.installer_latest = tag,
-                Check::Online(ok) => {
-                    self.probing = false;
-                    self.next_probe = Instant::now() + Duration::from_secs(5);
-                    if ok && matches!(&self.page, Page::Failed(e) if e == OFFLINE_MSG) {
-                        if self.latest.is_none() {
-                            self.check_latest(ctx);
-                        }
-                        self.retry();
-                    }
-                }
                 Check::Installed(dir, state) => {
                     if dir == self.checked_dir {
                         self.installed = Some(state);
                     }
                 }
+                Check::List(t, r) => {
+                    self.lists[t.idx()] = match r {
+                        Ok(v) => Load::Done(v),
+                        Err(_) => Load::Error,
+                    };
+                }
+                Check::Detail(t, tag, r) => {
+                    if t == self.target && tag == self.sel_tag && matches!(self.page, Page::Open) {
+                        match r {
+                            Ok(mut rel) => {
+                                if let Load::Done(list) = &self.lists[t.idx()] {
+                                    rel.latest = list.iter().any(|x| x.tag == rel.tag && x.latest);
+                                }
+                                self.detail = Load::Done(rel);
+                                self.page = Page::Detail;
+                            }
+                            Err(_) => self.detail = Load::Error,
+                        }
+                    }
+                }
             }
         }
 
-        // ---- messages from the worker thread
+        // ---- messages from the install worker thread
         if let Some(rx) = &self.rx {
             while let Ok(m) = rx.try_recv() {
                 match m {
-                    Msg::Progress(v) => self.target = self.target.max(v),
+                    Msg::Progress(v) => self.goal = self.goal.max(v),
                     Msg::Done => {
-                        self.target = 1.0;
+                        self.goal = 1.0;
                         self.done = true;
                     }
-                    Msg::Fail(e) => {
-                        self.page = Page::Failed(e);
-                        self.next_probe = Instant::now() + Duration::from_secs(5);
-                    }
+                    Msg::Fail(e) => self.page = Page::Failed(e),
                 }
-            }
-        }
-
-        // ---- offline: quietly check every few seconds and continue as soon as the internet is back
-        if let Page::Failed(err) = &self.page {
-            if err == OFFLINE_MSG {
-                if !self.probing && Instant::now() >= self.next_probe {
-                    self.probing = true;
-                    let (tx, c) = (self.check_tx.clone(), ctx.clone());
-                    thread::spawn(move || {
-                        let online = match ureq::get("https://api.github.com")
-                            .set("User-Agent", "akkhara-installer")
-                            .timeout(Duration::from_secs(4))
-                            .call()
-                        {
-                            Ok(_) | Err(ureq::Error::Status(..)) => true, // any HTTP answer = we are online
-                            Err(_) => false,
-                        };
-                        let _ = tx.send(Check::Online(online));
-                        c.request_repaint();
-                    });
-                }
-                ctx.request_repaint_after(Duration::from_millis(500));
             }
         }
 
         // ---- animation
         if matches!(self.page, Page::Working) {
-            self.shown += (self.target - self.shown) * 0.12;
+            self.shown += (self.goal - self.shown) * 0.12;
             if self.done && self.shown >= 0.995 {
                 self.shown = 1.0;
                 self.page = Page::Finished;
@@ -1017,6 +1225,7 @@ impl eframe::App for InstallerApp {
                 let full = ui.max_rect();
                 let o = full.min; // origin: design coordinates are relative to the card
                 let p = ui.painter().clone();
+                let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 
                 // drag the frameless window by its background
                 let drag = ui.interact(full, ui.id().with("drag"), Sense::drag());
@@ -1025,7 +1234,7 @@ impl eframe::App for InstallerApp {
                 }
 
                 // card
-                thick_box(&p, full.shrink(0.0), 26.0, CARD, 8.0);
+                thick_box(&p, full, 26.0, CARD, 8.0);
 
                 // close (x) button
                 let cx = Rect::from_center_size(pos2(full.max.x - 30.0, o.y + 30.0), vec2(24.0, 24.0));
@@ -1042,11 +1251,126 @@ impl eframe::App for InstallerApp {
                 }
 
                 match self.page.clone() {
-                    // ------------------------------------------------ setup (screenshot 1)
+                    // ------------------------------------------------------ main menu
+                    Page::Menu => {
+                        draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(26.0, 32.0), vec2(125.0, 125.0)));
+                        title(&p, o + vec2(254.0, 38.0), "Main Menu", 22.0);
+                        let panel = Rect::from_min_size(o + vec2(254.0, 67.0), vec2(426.0, 297.0));
+                        thick_box(&p, panel, 20.0, LIGHT, 8.0);
+                        p.image(
+                            self.about.handle.id(),
+                            Rect::from_center_size(panel.center(), self.about.size),
+                            uv,
+                            Color32::WHITE,
+                        );
+                        if menu_button(ui, &p, Rect::from_min_size(o + vec2(30.0, 194.0), vec2(199.0, 65.0)), "Akkhara Release", 16.0) {
+                            self.open_list(ctx, Target::Akkhara);
+                        }
+                        if menu_button(ui, &p, Rect::from_min_size(o + vec2(30.0, 271.0), vec2(199.0, 65.0)), "Installer release", 16.0) {
+                            self.open_list(ctx, Target::Installer);
+                        }
+                    }
+
+                    // ------------------------------------------------- release list
+                    Page::List => {
+                        draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(18.0, 15.0), vec2(126.0, 126.0)));
+                        title(&p, o + vec2(170.0, 39.0), self.target.title(), 17.0);
+                        let panel = Rect::from_min_size(o + vec2(166.0, 70.0), vec2(518.0, 289.0));
+                        thick_box(&p, panel, 18.0, LIGHT, 7.0);
+                        if menu_button(ui, &p, Rect::from_min_size(o + vec2(21.0, 300.0), vec2(119.0, 59.0)), "BACK", 15.0) {
+                            self.page = Page::Menu;
+                        }
+
+                        let t = self.target;
+                        let mut clicked: Option<String> = None;
+                        let mut retry = false;
+                        match &self.lists[t.idx()] {
+                            Load::Done(rels) => {
+                                if rels.is_empty() {
+                                    p.text(panel.center(), Align2::CENTER_CENTER, "No releases yet.", FontId::monospace(18.0), INK);
+                                } else {
+                                    clicked = release_list(ui, &p, panel, rels, t.idx());
+                                }
+                            }
+                            Load::Error => retry = error_view(ui, &p, panel),
+                            _ => loading_view(&p, panel),
+                        }
+                        if retry {
+                            self.fetch_list(ctx, t);
+                        }
+                        if let Some(tag) = clicked {
+                            self.open_release(ctx, tag);
+                        }
+                    }
+
+                    // ----------------------------- opening one release (loading / failed)
+                    Page::Open => {
+                        draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(18.0, 15.0), vec2(126.0, 126.0)));
+                        title(&p, o + vec2(170.0, 39.0), self.target.title(), 17.0);
+                        let panel = Rect::from_min_size(o + vec2(166.0, 70.0), vec2(518.0, 289.0));
+                        thick_box(&p, panel, 18.0, LIGHT, 7.0);
+                        if menu_button(ui, &p, Rect::from_min_size(o + vec2(21.0, 300.0), vec2(119.0, 59.0)), "BACK", 15.0) {
+                            self.page = Page::List;
+                        }
+                        if matches!(self.detail, Load::Error) {
+                            if error_view(ui, &p, panel) {
+                                self.fetch_detail(ctx);
+                            }
+                        } else {
+                            loading_view(&p, panel);
+                        }
+                    }
+
+                    // ----------------------------------------------- one release page
+                    Page::Detail => {
+                        draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(17.0, 13.0), vec2(123.0, 123.0)));
+                        let rel = match &self.detail {
+                            Load::Done(r) => Some(r.clone()),
+                            _ => None,
+                        };
+                        let bar = Rect::from_min_size(o + vec2(165.0, 13.0), vec2(521.0, 62.0));
+                        let panel = Rect::from_min_size(o + vec2(165.0, 88.0), vec2(521.0, 271.0));
+                        thick_box(&p, panel, 18.0, LIGHT, 7.0);
+
+                        if let Some(rel) = rel {
+                            draw_release_row(&p, bar, &rel, false);
+                            markdown_view(ui, &p, panel, &rel.body, &rel.tag);
+
+                            let label = match self.target {
+                                Target::Akkhara => self.akk_label(&rel.tag),
+                                Target::Installer => {
+                                    if is_newer(&rel.tag, INSTALLER_VERSION) { "Update" } else { "Install" }
+                                }
+                            };
+                            if menu_button(ui, &p, Rect::from_min_size(o + vec2(19.0, 233.0), vec2(119.0, 56.0)), label, 15.0) {
+                                self.chosen = Some(rel.clone());
+                                match self.target {
+                                    Target::Akkhara => self.page = Page::Setup,
+                                    Target::Installer => self.start_self_update(),
+                                }
+                            }
+                        }
+                        if menu_button(ui, &p, Rect::from_min_size(o + vec2(19.0, 301.0), vec2(119.0, 56.0)), "BACK", 15.0) {
+                            self.page = Page::List;
+                        }
+                    }
+
+                    // ----------------------------------------- install folder + PATH
                     Page::Setup => {
                         draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(22.0, 20.0), vec2(167.0, 167.0)));
-                        p.text(o + vec2(206.0, 62.0), Align2::LEFT_CENTER, "Install folder", FontId::monospace(20.0), INK);
+                        let tag = self.chosen.as_ref().map(|r| r.tag.clone()).unwrap_or_default();
+                        p.text(o + vec2(105.0, 208.0), Align2::CENTER_CENTER, &tag, FontId::monospace(16.0), BLUE);
+                        let bk = Rect::from_center_size(o + vec2(105.0, 240.0), vec2(80.0, 22.0));
+                        let br = ui.interact(bk, ui.id().with("setup_back"), Sense::click());
+                        p.text(bk.center(), Align2::CENTER_CENTER, "< Back", FontId::monospace(13.0), if br.hovered() { BLUE } else { Color32::from_rgb(20, 60, 100) });
+                        if br.hovered() {
+                            ctx.set_cursor_icon(CursorIcon::PointingHand);
+                        }
+                        if br.clicked() {
+                            self.page = Page::Detail;
+                        }
 
+                        p.text(o + vec2(206.0, 62.0), Align2::LEFT_CENTER, "Install folder", FontId::monospace(20.0), INK);
                         let field = Rect::from_min_size(o + vec2(205.0, 88.0), vec2(411.0, 42.0));
                         p.rect_filled(field.shrink(2.0), 14.0, LIGHT);
                         p.extend(egui::Shape::dashed_line(
@@ -1081,39 +1405,11 @@ impl eframe::App for InstallerApp {
                         }
                         p.text(o + vec2(245.0, 168.0), Align2::LEFT_CENTER, "Add akk to PATH", FontId::monospace(16.0), INK);
 
-                        let installer_update = self.installer_update_available();
-                        let btn_label = if installer_update {
-                            "Update Installer"
-                        } else if self.update_available() {
-                            "Update"
-                        } else {
-                            "Install"
-                        };
-                        if big_button(ui, &p, Rect::from_min_size(o + vec2(197.0, 197.0), vec2(383.0, 62.0)), btn_label) {
-                            if installer_update {
-                                self.start_self_update();
-                            } else if !self.dir.trim().is_empty() {
-                                self.start(false);
-                            }
-                        }
-
-                        // "What's new" link (only when an update with release notes exists)
-                        let has_notes = self.notes.as_ref().map(|n| !n.trim().is_empty()).unwrap_or(false);
-                        if self.update_available() && has_notes {
-                            let nr = Rect::from_center_size(o + vec2(556.0, 62.0), vec2(120.0, 22.0));
-                            let nresp = ui.interact(nr, ui.id().with("whatsnew"), Sense::click());
-                            let ncol = if nresp.hovered() { BLUE } else { Color32::from_rgb(20, 60, 100) };
-                            p.text(nr.center(), Align2::CENTER_CENTER, "What's new", FontId::monospace(13.0), ncol);
-                            p.line_segment(
-                                [pos2(nr.min.x + 10.0, nr.max.y - 2.0), pos2(nr.max.x - 10.0, nr.max.y - 2.0)],
-                                Stroke::new(1.5_f32, ncol),
-                            );
-                            if nresp.hovered() {
-                                ctx.set_cursor_icon(CursorIcon::PointingHand);
-                            }
-                            if nresp.clicked() {
-                                self.page = Page::Notes;
-                            }
+                        let btn_label = self.akk_label(&tag);
+                        if big_button(ui, &p, Rect::from_min_size(o + vec2(197.0, 197.0), vec2(383.0, 62.0)), btn_label)
+                            && !self.dir.trim().is_empty()
+                        {
+                            self.start(false);
                         }
 
                         // small uninstall link
@@ -1129,10 +1425,22 @@ impl eframe::App for InstallerApp {
                         }
                     }
 
-                    // --------------------------------------------- installing (screenshot 2)
+                    // ------------------------------------------------------ installing
                     Page::Working => {
                         draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(22.0, 17.0), vec2(168.0, 168.0)));
-                        heading(&p, o + vec2(0.0, 53.0), if self.self_updating { "Updating installer..." } else if self.uninstalling { "Uninstalling..." } else if self.updating { "Updating..." } else { "Installing..." });
+                        heading(
+                            &p,
+                            o + vec2(0.0, 53.0),
+                            if self.self_updating {
+                                "Updating installer..."
+                            } else if self.uninstalling {
+                                "Uninstalling..."
+                            } else if self.updating {
+                                "Updating..."
+                            } else {
+                                "Installing..."
+                            },
+                        );
 
                         let bar = Rect::from_min_size(o + vec2(207.0, 81.0), vec2(407.0, 47.0));
                         thick_box(&p, bar, 18.0, LIGHT, 6.0);
@@ -1165,18 +1473,13 @@ impl eframe::App for InstallerApp {
 
                         let t = &self.msgs[self.msg_idx];
                         let rect = Rect::from_center_size(pos2(full.center().x, o.y + 222.0), t.size);
-                        p.image(
-                            t.handle.id(),
-                            rect,
-                            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                            Color32::WHITE,
-                        );
+                        p.image(t.handle.id(), rect, uv, Color32::WHITE);
                     }
 
                     // ------------------------------------------------------- finished
                     Page::Finished => {
                         draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(22.0, 17.0), vec2(168.0, 168.0)));
-                        let title = if self.self_updating {
+                        let title_text = if self.self_updating {
                             "Installer updated!"
                         } else if self.uninstalling {
                             "Uninstall complete!"
@@ -1185,7 +1488,7 @@ impl eframe::App for InstallerApp {
                         } else {
                             "Installation complete!"
                         };
-                        heading(&p, o + vec2(0.0, 48.0), title);
+                        heading(&p, o + vec2(0.0, 48.0), title_text);
 
                         if self.self_updating {
                             p.text(o + vec2(207.0, 96.0), Align2::LEFT_CENTER, "Restart to use the new version.", FontId::monospace(14.0), INK);
@@ -1219,47 +1522,15 @@ impl eframe::App for InstallerApp {
                         if err.chars().count() > 260 {
                             text.push_str("...");
                         }
-                        if err == OFFLINE_MSG {
-                            text.push_str("\nRetrying automatically...");
-                        }
                         let galley = p.layout(text, FontId::monospace(13.0), INK, 407.0);
                         p.galley(o + vec2(207.0, 78.0), galley, INK);
-                        if let Some((_, t)) = self.error_imgs.iter().find(|(m, _)| *m == err.as_str()) {
-                            let rect = Rect::from_min_size(o + vec2(207.0, 130.0), t.size);
-                            p.image(
-                                t.handle.id(),
-                                rect,
-                                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                                Color32::WHITE,
-                            );
-                        }
-                        if big_button(ui, &p, Rect::from_min_size(o + vec2(207.0, 208.0), vec2(150.0, 50.0)), "Back") {
-                            self.page = Page::Setup;
-                            self.check_installed(ctx);
-                            if self.latest.is_none() {
-                                self.check_latest(ctx);
-                            }
-                        }
-                        if big_button(ui, &p, Rect::from_min_size(o + vec2(367.0, 208.0), vec2(247.0, 50.0)), "Retry") {
-                            self.retry();
-                        }
-                    }
-
-                    // ---------------------------------------------------- what's new
-                    Page::Notes => {
-                        draw_logo(&p, &self.logo, Rect::from_min_size(o + vec2(22.0, 17.0), vec2(168.0, 168.0)));
-                        let title = format!("What's new in {}", self.latest.as_deref().unwrap_or("latest"));
-                        heading(&p, o + vec2(0.0, 48.0), &title);
-                        let mut notes = self.notes.clone().unwrap_or_default();
-                        if notes.trim().is_empty() {
-                            notes = "No release notes were provided.".to_string();
-                        }
-                        let mut job = egui::text::LayoutJob::simple(notes, FontId::monospace(13.0), INK, 407.0);
-                        job.wrap.max_rows = 8;
-                        let galley = p.layout_job(job);
-                        p.galley(o + vec2(207.0, 78.0), galley, INK);
                         if big_button(ui, &p, Rect::from_min_size(o + vec2(207.0, 208.0), vec2(407.0, 50.0)), "Back") {
-                            self.page = Page::Setup;
+                            if self.self_updating {
+                                self.page = Page::Detail;
+                            } else {
+                                self.page = Page::Setup;
+                                self.check_installed(ctx);
+                            }
                         }
                     }
                 }
@@ -1287,10 +1558,12 @@ fn main() -> eframe::Result<()> {
     }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Akkhara Installer")
-        .with_inner_size([WIN_W, WIN_H])
+        .with_inner_size([MENU_W, MENU_H])
+        .with_min_inner_size([MENU_W, MENU_H])
+        .with_max_inner_size([MENU_W, MENU_H])
         .with_decorations(false)
         .with_transparent(true)
-        .with_resizable(false);
+        .with_resizable(true);
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -1304,43 +1577,4 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(InstallerApp::new(cc)))),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const H: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"; // sha256("abc")
-
-    #[test]
-    fn sha256_matches_known_value() {
-        assert_eq!(sha256_hex(b"abc"), H);
-    }
-
-    #[test]
-    fn parses_checksum_formats() {
-        assert_eq!(parse_checksum(&format!("{H}\n"), "x.zip").as_deref(), Some(H));
-        assert_eq!(parse_checksum(&format!("{H}  x.zip\n"), "x.zip").as_deref(), Some(H));
-        assert_eq!(parse_checksum(&format!("{}  y.zip\n{H} *x.zip\n", "0".repeat(64)), "x.zip").as_deref(), Some(H));
-        assert_eq!(parse_checksum(&format!("{}  y.zip\n", "0".repeat(64)), "x.zip"), None);
-        assert_eq!(parse_checksum("not a hash", "x.zip"), None);
-    }
-
-    #[test]
-    fn finds_checksum_asset() {
-        let rel = serde_json::json!({"assets": [
-            {"name": "a.zip", "browser_download_url": "u1"},
-            {"name": "a.zip.sha256", "browser_download_url": "u2"},
-            {"name": "SHA256SUMS", "browser_download_url": "u3"}]});
-        assert_eq!(find_checksum_url(&rel, "a.zip").as_deref(), Some("u2"));
-        assert_eq!(find_checksum_url(&rel, "b.zip").as_deref(), Some("u3"));
-        let none = serde_json::json!({"assets": [{"name": "a.zip", "browser_download_url": "u1"}]});
-        assert_eq!(find_checksum_url(&none, "a.zip"), None);
-    }
-
-    #[test]
-    fn cleans_release_notes() {
-        let md = "## What's new\n- **Faster** `akk` startup\n* See [docs](https://x.y/z)\n\nအသစ်များ\nFull Changelog: https://github.com/a/b";
-        assert_eq!(clean_notes(md), "What's new\n- Faster akk startup\n- See docs");
-    }
 }
