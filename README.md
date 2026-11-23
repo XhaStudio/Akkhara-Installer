@@ -38,3 +38,11 @@ Main Menu -> "Akkhara Release" / "Installer release" -> release list (rows: vers
 - Installer release: Install replaces this installer with that version, then Restart.
 - Failed loads show the retry icon; click it to try again.
 `assets/about.png` is the pre-rendered Burmese paragraph on the Main Menu.
+
+## Release notes (markdown + Burmese)
+Release notes are rendered by a small built-in markdown renderer: headings, **bold**, *italic*, `code`,
+~~strike~~, links, bullet / numbered / nested lists, > quotes, --- rules, tables (as rows) and code blocks.
+egui cannot shape Myanmar script, so any line containing Burmese is shaped with rustybuzz (`src/mmtext.rs`) and
+drawn as an image. Bundled fonts (in `assets/`):
+- Noto Sans Myanmar - SIL Open Font License 1.1 (see `assets/OFL.txt`)
+- DejaVu Sans Mono - free license (Bitstream Vera / DejaVu), used for Latin text inside Burmese lines
