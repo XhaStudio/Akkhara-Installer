@@ -14,6 +14,7 @@ use std::{
 mod mmtext;
 use mmtext::{contains_myanmar, Shaper};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 const REPO: &str = "XhaStudio/Akkhara-Programming-Language";
 const INSTALLER_REPO: &str = "XhaStudio/Akkhara-Installer";
@@ -644,6 +645,7 @@ struct InstallerApp {
     about: Tex,
     shaper: Option<Shaper>,
     md_cache: HashMap<String, Tex>,
+    md_wraps: HashMap<String, Rc<Vec<String>>>,
     msgs: Vec<Tex>,
     check_tx: Sender<Check>,
     check_rx: Receiver<Check>,
@@ -680,6 +682,7 @@ impl InstallerApp {
             about: load_tex(ctx, "about", ABOUT_PNG, 2.0),
             shaper: Shaper::new(),
             md_cache: HashMap::new(),
+            md_wraps: HashMap::new(),
             msgs: MESSAGE_PNGS
                 .iter()
                 .enumerate()
@@ -968,21 +971,77 @@ fn draw_release_row(p: &egui::Painter, rect: Rect, r: &Release, hover: bool) {
     }
 }
 
-fn scroll_thumb<R>(p: &egui::Painter, panel: Rect, out: &egui::scroll_area::ScrollAreaOutput<R>) {
-    let view_h = out.inner_rect.height();
-    let content_h = out.content_size.y;
-    if content_h <= view_h + 1.0 {
-        return;
-    }
+/// Scrollable area with a draggable scrollbar thumb on the right edge of `panel`.
+/// Mouse wheel / touchpad scrolling is egui's own; the thumb can also be dragged,
+/// and clicking the track jumps there.
+fn scroll_panel<R>(
+    ui: &mut egui::Ui,
+    p: &egui::Painter,
+    panel: Rect,
+    view: Rect,
+    key: impl std::hash::Hash,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let key_id = egui::Id::new(key);
+    let id = ui.id().with(("scroll_panel", key_id));
     let track = Rect::from_min_max(
         pos2(panel.max.x - 30.0, panel.min.y + 14.0),
         pos2(panel.max.x - 17.0, panel.max.y - 14.0),
     );
-    p.rect_filled(track, 7.0, TRACK);
-    let th = (track.height() * view_h / content_h).clamp(36.0, track.height());
-    let t = (out.state.offset.y / (content_h - view_h)).clamp(0.0, 1.0);
-    let y = track.min.y + t * (track.height() - th);
-    p.rect_filled(Rect::from_min_size(pos2(track.min.x, y), vec2(track.width(), th)), 7.0, THUMB);
+
+    // thumb interaction, using last frame's measurements
+    let mut forced: Option<f32> = None;
+    let mut dragging = false;
+    let metrics: Option<(f32, f32, f32)> = ui.ctx().data(|d| d.get_temp(id));
+    if let Some((off, content_h, view_h)) = metrics {
+        if content_h > view_h + 1.0 {
+            let max_off = content_h - view_h;
+            let th = (track.height() * view_h / content_h).clamp(36.0, track.height());
+            let room = (track.height() - th).max(1.0);
+            let hit = Rect::from_min_max(
+                pos2(track.min.x - 10.0, track.min.y),
+                pos2(track.max.x + 8.0, track.max.y),
+            );
+            let resp = ui.interact(hit, id.with("bar"), Sense::click_and_drag());
+            if resp.hovered() || resp.dragged() {
+                ui.ctx().set_cursor_icon(CursorIcon::Grab);
+            }
+            if resp.dragged() {
+                dragging = true;
+                forced = Some((off + resp.drag_delta().y * max_off / room).clamp(0.0, max_off));
+            } else if resp.clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let t = ((pos.y - track.min.y - th / 2.0) / room).clamp(0.0, 1.0);
+                    forced = Some(t * max_off);
+                }
+            }
+        }
+    }
+
+    let mut area = egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+    if let Some(o) = forced {
+        area = area.vertical_scroll_offset(o);
+    }
+    let out = ui
+        .allocate_new_ui(egui::UiBuilder::new().max_rect(view), |ui| {
+            ui.push_id(key_id, |ui| area.show(ui, add)).inner
+        })
+        .inner;
+
+    let (off, content_h, view_h) = (out.state.offset.y, out.content_size.y, out.inner_rect.height());
+    ui.ctx().data_mut(|d| d.insert_temp(id, (off, content_h, view_h)));
+    if content_h > view_h + 1.0 {
+        let max_off = content_h - view_h;
+        let th = (track.height() * view_h / content_h).clamp(36.0, track.height());
+        let t = (off / max_off).clamp(0.0, 1.0);
+        let y = track.min.y + t * (track.height() - th);
+        p.rect_filled(track, 7.0, TRACK);
+        let col = if dragging { Color32::from_rgb(45, 90, 120) } else { THUMB };
+        p.rect_filled(Rect::from_min_size(pos2(track.min.x, y), vec2(track.width(), th)), 7.0, col);
+    }
+    out.inner
 }
 
 /// Scrollable list of release rows inside `panel`. Returns the tag that was clicked.
@@ -992,30 +1051,19 @@ fn release_list(ui: &mut egui::Ui, p: &egui::Painter, panel: Rect, rels: &[Relea
         pos2(panel.max.x - 40.0, panel.max.y - 12.0),
     );
     let mut clicked = None;
-    let out = ui
-        .allocate_new_ui(egui::UiBuilder::new().max_rect(view), |ui| {
-            ui.push_id(("rel_list", key), |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 12.0;
-                        for r in rels {
-                            let (rect, resp) = ui.allocate_exact_size(vec2(view.width(), 61.0), Sense::click());
-                            draw_release_row(ui.painter(), rect, r, resp.hovered());
-                            if resp.hovered() {
-                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                            }
-                            if resp.clicked() {
-                                clicked = Some(r.tag.clone());
-                            }
-                        }
-                    })
-            })
-            .inner
-        })
-        .inner;
-    scroll_thumb(p, panel, &out);
+    scroll_panel(ui, p, panel, view, ("rel_list", key), |ui| {
+        ui.spacing_mut().item_spacing.y = 12.0;
+        for r in rels {
+            let (rect, resp) = ui.allocate_exact_size(vec2(view.width(), 61.0), Sense::click());
+            draw_release_row(ui.painter(), rect, r, resp.hovered());
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
+                clicked = Some(r.tag.clone());
+            }
+        }
+    });
     clicked
 }
 
@@ -1061,6 +1109,7 @@ fn error_view(ui: &mut egui::Ui, p: &egui::Painter, panel: Rect) -> bool {
 struct MdCtx<'a> {
     shaper: Option<&'a Shaper>,
     cache: &'a mut HashMap<String, Tex>,
+    wraps: &'a mut HashMap<String, Rc<Vec<String>>>,
     ctx: &'a egui::Context,
 }
 
@@ -1221,16 +1270,22 @@ fn md_block(ui: &mut egui::Ui, md: &mut MdCtx, text: &str, size: f32, bold: bool
         let plain = clean_inline(text);
         let px = size + 1.5;
         let avail = (ui.available_width() - indent).max(80.0);
-        let lines = md
-            .shaper
-            .map(|s| s.wrap(&plain, px * 2.0, avail * 2.0))
-            .unwrap_or_default();
+        // wrapping needs shaping, which is slow: do it once per (text, size, width), not per frame
+        let wkey = format!("{px}|{:.0}|{plain}", avail);
+        if !md.wraps.contains_key(&wkey) {
+            let wrapped = md
+                .shaper
+                .map(|s| s.wrap(&plain, px * 2.0, avail * 2.0))
+                .unwrap_or_default();
+            md.wraps.insert(wkey.clone(), Rc::new(wrapped));
+        }
+        let lines = md.wraps.get(&wkey).cloned().unwrap_or_default();
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.add_space(indent);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                for l in &lines {
+                for l in lines.iter() {
                     if let Some((id, sz)) = mm_texture(md, l, px) {
                         ui.image((id, sz));
                     }
@@ -1368,23 +1423,12 @@ fn markdown_view(ui: &mut egui::Ui, p: &egui::Painter, panel: Rect, body: &str, 
         panel.min + vec2(16.0, 12.0),
         pos2(panel.max.x - 40.0, panel.max.y - 12.0),
     );
-    let out = ui
-        .allocate_new_ui(egui::UiBuilder::new().max_rect(view), |ui| {
-            ui.push_id(("notes", key), |ui| {
-                ui.style_mut().visuals.override_text_color = Some(INK);
-                ui.style_mut().interaction.selectable_labels = false;
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                    .show(ui, |ui| {
-                        ui.set_width(view.width());
-                        render_markdown(ui, body, md);
-                    })
-            })
-            .inner
-        })
-        .inner;
-    scroll_thumb(p, panel, &out);
+    scroll_panel(ui, p, panel, view, ("notes", key), |ui| {
+        ui.style_mut().visuals.override_text_color = Some(INK);
+        ui.style_mut().interaction.selectable_labels = false;
+        ui.set_width(view.width());
+        render_markdown(ui, body, md);
+    });
 }
 
 impl eframe::App for InstallerApp {
@@ -1581,6 +1625,7 @@ impl eframe::App for InstallerApp {
                             let mut md = MdCtx {
                                 shaper: self.shaper.as_ref(),
                                 cache: &mut self.md_cache,
+                                wraps: &mut self.md_wraps,
                                 ctx,
                             };
                             markdown_view(ui, &p, panel, &rel.body, &rel.tag, &mut md);
