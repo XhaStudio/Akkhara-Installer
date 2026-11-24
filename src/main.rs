@@ -11,8 +11,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod markdown;
 mod mmtext;
-use mmtext::{contains_myanmar, Shaper};
+use markdown::MdCtx;
+use mmtext::Shaper;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -646,6 +648,7 @@ struct InstallerApp {
     shaper: Option<Shaper>,
     md_cache: HashMap<String, Tex>,
     md_wraps: HashMap<String, Rc<Vec<String>>>,
+    md_parsed: HashMap<u64, Rc<Vec<markdown::Block>>>,
     msgs: Vec<Tex>,
     check_tx: Sender<Check>,
     check_rx: Receiver<Check>,
@@ -683,6 +686,7 @@ impl InstallerApp {
             shaper: Shaper::new(),
             md_cache: HashMap::new(),
             md_wraps: HashMap::new(),
+            md_parsed: HashMap::new(),
             msgs: MESSAGE_PNGS
                 .iter()
                 .enumerate()
@@ -1104,320 +1108,6 @@ fn error_view(ui: &mut egui::Ui, p: &egui::Painter, panel: Rect) -> bool {
     resp.clicked()
 }
 
-// ---- release notes: markdown + Burmese text
-
-struct MdCtx<'a> {
-    shaper: Option<&'a Shaper>,
-    cache: &'a mut HashMap<String, Tex>,
-    wraps: &'a mut HashMap<String, Rc<Vec<String>>>,
-    ctx: &'a egui::Context,
-}
-
-const CODE_BG: Color32 = Color32::from_rgb(160, 215, 245);
-const BOLD_INK: Color32 = Color32::from_rgb(8, 36, 100);
-
-/// Plain text of a markdown line (markers removed) - used for Burmese lines drawn as images.
-fn clean_inline(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '*' || c == '`' || c == '~' {
-            i += 1;
-            continue;
-        }
-        if c == '_' && chars.get(i + 1) == Some(&'_') {
-            i += 2;
-            continue;
-        }
-        if c == '[' {
-            if let Some(close) = chars[i..].iter().position(|&x| x == ']') {
-                let j = i + close;
-                if chars.get(j + 1) == Some(&'(') {
-                    if let Some(pc) = chars[j..].iter().position(|&x| x == ')') {
-                        out.extend(chars[i + 1..j].iter());
-                        i = j + pc + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_seg(
-    job: &mut egui::text::LayoutJob,
-    s: &str,
-    size: f32,
-    bold: bool,
-    italic: bool,
-    code: bool,
-    strike: bool,
-    link: bool,
-) {
-    if s.is_empty() {
-        return;
-    }
-    let color = if link {
-        BLUE
-    } else if bold {
-        BOLD_INK
-    } else {
-        INK
-    };
-    let fmt = egui::TextFormat {
-        font_id: FontId::monospace(size),
-        color,
-        italics: italic,
-        background: if code { CODE_BG } else { Color32::TRANSPARENT },
-        strikethrough: if strike { Stroke::new(1.5_f32, INK) } else { Stroke::NONE },
-        underline: if link { Stroke::new(1.0_f32, BLUE) } else { Stroke::NONE },
-        ..Default::default()
-    };
-    job.append(s, 0.0, fmt);
-}
-
-/// **bold**, *italic*, `code`, ~~strike~~ and [links](url) -> styled text.
-fn inline_job(text: &str, size: f32, bold_all: bool) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::default();
-    let chars: Vec<char> = text.chars().collect();
-    let (mut bold, mut italic, mut code, mut strike) = (bold_all, false, false, false);
-    let mut buf = String::new();
-    macro_rules! flush {
-        () => {
-            push_seg(&mut job, &buf, size, bold, italic, code, strike, false);
-            buf.clear();
-        };
-    }
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        if code && c != '`' {
-            buf.push(c);
-            i += 1;
-            continue;
-        }
-        if (c == '*' && next == Some('*')) || (c == '_' && next == Some('_')) {
-            flush!();
-            bold = !bold;
-            i += 2;
-        } else if c == '~' && next == Some('~') {
-            flush!();
-            strike = !strike;
-            i += 2;
-        } else if c == '*' {
-            flush!();
-            italic = !italic;
-            i += 1;
-        } else if c == '`' {
-            flush!();
-            code = !code;
-            i += 1;
-        } else if c == '[' {
-            let close = chars[i..].iter().position(|&x| x == ']').map(|k| i + k);
-            let paren = close
-                .filter(|&j| chars.get(j + 1) == Some(&'('))
-                .and_then(|j| chars[j..].iter().position(|&x| x == ')').map(|k| (j, j + k)));
-            if let Some((j, end)) = paren {
-                flush!();
-                let label: String = chars[i + 1..j].iter().collect();
-                push_seg(&mut job, &label, size, bold, italic, false, strike, true);
-                i = end + 1;
-            } else {
-                buf.push(c);
-                i += 1;
-            }
-        } else {
-            buf.push(c);
-            i += 1;
-        }
-    }
-    flush!();
-    job
-}
-
-/// A Burmese line as a texture (cached by text + size).
-fn mm_texture(md: &mut MdCtx, line: &str, px: f32) -> Option<(egui::TextureId, egui::Vec2)> {
-    let sh = md.shaper?;
-    let key = format!("{px}|{line}");
-    if !md.cache.contains_key(&key) {
-        let (w, h, pix) = sh.render(line, px * 2.0, [0, 0, 0])?;
-        let ci = egui::ColorImage::from_rgba_unmultiplied([w, h], &pix);
-        let name = format!("md{}", md.cache.len());
-        let handle = md.ctx.load_texture(name, ci, egui::TextureOptions::LINEAR);
-        md.cache.insert(
-            key.clone(),
-            Tex {
-                handle,
-                size: vec2(w as f32 / 2.0, h as f32 / 2.0),
-            },
-        );
-    }
-    let t = md.cache.get(&key)?;
-    Some((t.handle.id(), t.size))
-}
-
-/// One paragraph / heading / list item. Burmese is shaped and drawn as images,
-/// everything else is normal styled text.
-fn md_block(ui: &mut egui::Ui, md: &mut MdCtx, text: &str, size: f32, bold: bool, indent: f32) {
-    if contains_myanmar(text) && md.shaper.is_some() {
-        let plain = clean_inline(text);
-        let px = size + 1.5;
-        let avail = (ui.available_width() - indent).max(80.0);
-        // wrapping needs shaping, which is slow: do it once per (text, size, width), not per frame
-        let wkey = format!("{px}|{:.0}|{plain}", avail);
-        if !md.wraps.contains_key(&wkey) {
-            let wrapped = md
-                .shaper
-                .map(|s| s.wrap(&plain, px * 2.0, avail * 2.0))
-                .unwrap_or_default();
-            md.wraps.insert(wkey.clone(), Rc::new(wrapped));
-        }
-        let lines = md.wraps.get(&wkey).cloned().unwrap_or_default();
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            ui.add_space(indent);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                for l in lines.iter() {
-                    if let Some((id, sz)) = mm_texture(md, l, px) {
-                        ui.image((id, sz));
-                    }
-                }
-            });
-        });
-    } else {
-        let job = inline_job(text, size, bold);
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            ui.add_space(indent);
-            ui.vertical(|ui| {
-                ui.label(job);
-            });
-        });
-    }
-}
-
-fn heading_of(t: &str) -> Option<(usize, &str)> {
-    let n = t.chars().take_while(|c| *c == '#').count();
-    if (1..=6).contains(&n) && t[n..].starts_with(' ') {
-        Some((n, t[n..].trim()))
-    } else {
-        None
-    }
-}
-
-fn is_hr(t: &str) -> bool {
-    let s: String = t.chars().filter(|c| !c.is_whitespace()).collect();
-    s.len() >= 3
-        && (s.chars().all(|c| c == '-') || s.chars().all(|c| c == '*') || s.chars().all(|c| c == '_'))
-}
-
-fn numbered_of(t: &str) -> Option<(&str, &str)> {
-    let d = t.chars().take_while(|c| c.is_ascii_digit()).count();
-    if (1..=3).contains(&d) {
-        let rest = &t[d..];
-        if rest.starts_with(". ") || rest.starts_with(") ") {
-            return Some((&t[..d], rest[2..].trim_start()));
-        }
-    }
-    None
-}
-
-fn render_markdown(ui: &mut egui::Ui, text: &str, md: &mut MdCtx) {
-    if text.trim().is_empty() {
-        ui.label(egui::RichText::new("No release notes.").monospace().size(14.0).color(INK));
-        return;
-    }
-    ui.spacing_mut().item_spacing.y = 3.0;
-    let mut in_code = false;
-    for raw in text.lines() {
-        let line = raw.trim_end();
-        let tt = line.trim_start();
-        if tt.starts_with("```") || tt.starts_with("~~~") {
-            in_code = !in_code;
-            continue;
-        }
-        if in_code {
-            ui.label(
-                egui::RichText::new(line)
-                    .monospace()
-                    .size(12.0)
-                    .color(INK)
-                    .background_color(CODE_BG),
-            );
-            continue;
-        }
-        if tt.is_empty() {
-            ui.add_space(5.0);
-            continue;
-        }
-        if is_hr(tt) {
-            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 12.0), Sense::hover());
-            ui.painter()
-                .hline(r.x_range(), r.center().y, Stroke::new(2.0_f32, Color32::from_rgb(90, 120, 150)));
-            continue;
-        }
-        let lead: usize = line
-            .chars()
-            .take_while(|c| *c == ' ' || *c == '\t')
-            .map(|c| if c == '\t' { 4 } else { 1 })
-            .sum();
-        let level = (lead / 2).min(4);
-        let indent = level as f32 * 14.0;
-
-        if let Some((n, h)) = heading_of(tt) {
-            let size = match n {
-                1 => 20.0,
-                2 => 17.0,
-                _ => 15.0,
-            };
-            if n <= 2 {
-                ui.add_space(4.0);
-            }
-            md_block(ui, md, h, size, true, 0.0);
-        } else if let Some(q) = tt.strip_prefix('>') {
-            let y0 = ui.cursor().min.y;
-            let x0 = ui.cursor().min.x;
-            md_block(ui, md, q.trim_start_matches('>').trim(), 13.0, false, 16.0 + indent);
-            let y1 = ui.min_rect().max.y;
-            ui.painter().rect_filled(
-                Rect::from_min_max(pos2(x0 + 3.0, y0), pos2(x0 + 6.0, y1)),
-                1.0,
-                GREY,
-            );
-        } else if tt.starts_with('|') {
-            if tt.chars().all(|c| "|-: \t".contains(c)) {
-                continue; // table separator row
-            }
-            let row = tt
-                .trim_matches('|')
-                .split('|')
-                .map(|c| c.trim())
-                .collect::<Vec<_>>()
-                .join("  |  ");
-            md_block(ui, md, &row, 12.5, false, indent);
-        } else if let Some(rest) = tt
-            .strip_prefix("- ")
-            .or_else(|| tt.strip_prefix("* "))
-            .or_else(|| tt.strip_prefix("+ "))
-        {
-            let mark = if level == 0 { "•" } else { "–" };
-            md_block(ui, md, &format!("{mark} {rest}"), 13.0, false, indent);
-        } else if let Some((n, rest)) = numbered_of(tt) {
-            md_block(ui, md, &format!("{n}. {rest}"), 13.0, false, indent);
-        } else {
-            md_block(ui, md, tt, 13.0, false, 0.0);
-        }
-    }
-}
-
 fn markdown_view(ui: &mut egui::Ui, p: &egui::Painter, panel: Rect, body: &str, key: &str, md: &mut MdCtx) {
     let view = Rect::from_min_max(
         panel.min + vec2(16.0, 12.0),
@@ -1427,7 +1117,7 @@ fn markdown_view(ui: &mut egui::Ui, p: &egui::Painter, panel: Rect, body: &str, 
         ui.style_mut().visuals.override_text_color = Some(INK);
         ui.style_mut().interaction.selectable_labels = false;
         ui.set_width(view.width());
-        render_markdown(ui, body, md);
+        markdown::render_text(ui, body, md);
     });
 }
 
@@ -1626,9 +1316,11 @@ impl eframe::App for InstallerApp {
                                 shaper: self.shaper.as_ref(),
                                 cache: &mut self.md_cache,
                                 wraps: &mut self.md_wraps,
+                                parsed: &mut self.md_parsed,
                                 ctx,
                             };
-                            markdown_view(ui, &p, panel, &rel.body, &rel.tag, &mut md);
+                            let notes_key = format!("{}:{}", self.target.idx(), rel.tag);
+                            markdown_view(ui, &p, panel, &rel.body, &notes_key, &mut md);
 
                             let label = match self.target {
                                 Target::Akkhara => self.akk_label(&rel.tag),
