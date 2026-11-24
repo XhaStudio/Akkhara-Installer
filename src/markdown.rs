@@ -693,7 +693,7 @@ fn job_of(spans: &[Span], size: f32, force_bold: bool) -> egui::text::LayoutJob 
 }
 
 /// A Burmese line as a texture (cached by text + size).
-fn mm_texture(md: &mut MdCtx, line: &str, px: f32) -> Option<(egui::TextureId, egui::Vec2)> {
+pub fn mm_texture(md: &mut MdCtx, line: &str, px: f32) -> Option<(egui::TextureId, egui::Vec2)> {
     let sh = md.shaper?;
     let key = format!("{px}|{line}");
     if !md.cache.contains_key(&key) {
@@ -713,6 +713,19 @@ fn mm_texture(md: &mut MdCtx, line: &str, px: f32) -> Option<(egui::TextureId, e
     Some((t.handle.id(), t.size))
 }
 
+/// Burmese text wrapped to `avail` px (shaping is slow, so the result is cached).
+pub fn mm_lines(md: &mut MdCtx, text: &str, px: f32, avail: f32) -> Rc<Vec<String>> {
+    let wkey = format!("{px}|{:.0}|{text}", avail);
+    if !md.wraps.contains_key(&wkey) {
+        let wrapped = md
+            .shaper
+            .map(|s| s.wrap(text, px * 2.0, avail * 2.0))
+            .unwrap_or_default();
+        md.wraps.insert(wkey.clone(), Rc::new(wrapped));
+    }
+    md.wraps.get(&wkey).cloned().unwrap_or_default()
+}
+
 /// One paragraph / heading / list item. Burmese is shaped and drawn as images,
 /// everything else is normal styled text.
 fn md_block(ui: &mut egui::Ui, md: &mut MdCtx, spans: &[Span], size: f32, bold: bool, indent: f32) {
@@ -720,16 +733,7 @@ fn md_block(ui: &mut egui::Ui, md: &mut MdCtx, spans: &[Span], size: f32, bold: 
     if contains_myanmar(&text) && md.shaper.is_some() {
         let px = size + 1.5;
         let avail = (ui.available_width() - indent).max(80.0);
-        // wrapping needs shaping, which is slow: do it once per (text, size, width), not per frame
-        let wkey = format!("{px}|{:.0}|{text}", avail);
-        if !md.wraps.contains_key(&wkey) {
-            let wrapped = md
-                .shaper
-                .map(|s| s.wrap(&text, px * 2.0, avail * 2.0))
-                .unwrap_or_default();
-            md.wraps.insert(wkey.clone(), Rc::new(wrapped));
-        }
-        let lines = md.wraps.get(&wkey).cloned().unwrap_or_default();
+        let lines = mm_lines(md, &text, px, avail);
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.add_space(indent);
