@@ -14,9 +14,11 @@ use std::{
 mod markdown;
 mod mmtext;
 mod toast;
+mod version;
 use markdown::MdCtx;
 use mmtext::Shaper;
 use toast::{Action, Kind, Toast};
+use version::{is_newer, parse_version, same_version};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -343,33 +345,6 @@ enum Installed {
     None,            // no akk in the install folder
     Unknown,         // akk exists but its version could not be read
     Version(String), // e.g. "1.1.0"
-}
-
-fn parse_version(text: &str) -> Option<String> {
-    text.split(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .map(|t| t.trim_matches('.'))
-        .find(|t| {
-            t.contains('.') && t.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-        })
-        .map(|t| t.to_string())
-}
-
-fn version_nums(v: &str) -> Vec<u64> {
-    v.trim_start_matches('v')
-        .split('.')
-        .map(|p| p.parse().unwrap_or(0))
-        .collect()
-}
-
-fn is_newer(latest: &str, installed: &str) -> bool {
-    let (a, b) = (version_nums(latest), version_nums(installed));
-    for i in 0..a.len().max(b.len()) {
-        let (x, y) = (*a.get(i).unwrap_or(&0), *b.get(i).unwrap_or(&0));
-        if x != y {
-            return x > y;
-        }
-    }
-    false
 }
 
 /// Runs `<dir>/akk --version` and reads the version number from its output.
@@ -774,6 +749,20 @@ impl InstallerApp {
         self.sel_tag = tag;
         self.page = Page::Open;
         self.fetch_detail(ctx);
+    }
+
+    /// Is exactly this akk version already installed (in the folder we checked)?
+    fn akk_already(&self, tag: &str) -> bool {
+        matches!(&self.installed, Some(Installed::Version(v)) if same_version(tag, v))
+    }
+
+    /// Show a card; if the same one is already on screen just restart its timer.
+    fn push_toast(&mut self, kind: Kind) {
+        if let Some(t) = self.toasts.iter_mut().find(|t| t.is(&kind)) {
+            t.restart();
+        } else {
+            self.toasts.push(Toast::new(kind));
+        }
     }
 
     /// "Update" when akk is installed and this release is newer than it, else "Install".
@@ -1393,8 +1382,20 @@ impl eframe::App for InstallerApp {
                             if menu_button(ui, &p, Rect::from_min_size(o + vec2(19.0, 233.0), vec2(119.0, 56.0)), label, 15.0) {
                                 self.chosen = Some(rel.clone());
                                 match self.target {
-                                    Target::Akkhara => self.page = Page::Setup,
-                                    Target::Installer => self.start_self_update(),
+                                    Target::Akkhara => {
+                                        if self.akk_already(&rel.tag) {
+                                            self.push_toast(Kind::Installed(rel.tag.clone()));
+                                        } else {
+                                            self.page = Page::Setup;
+                                        }
+                                    }
+                                    Target::Installer => {
+                                        if same_version(&rel.tag, INSTALLER_VERSION) {
+                                            self.push_toast(Kind::Installed(rel.tag.clone()));
+                                        } else {
+                                            self.start_self_update();
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1457,7 +1458,11 @@ impl eframe::App for InstallerApp {
                         if big_button(ui, &p, Rect::from_min_size(o + vec2(197.0, 197.0), vec2(383.0, 62.0)), btn_label)
                             && !self.dir.trim().is_empty()
                         {
-                            self.start(false);
+                            if self.akk_already(&tag) {
+                                self.push_toast(Kind::Installed(tag.clone()));
+                            } else {
+                                self.start(false);
+                            }
                         }
 
                         // small uninstall link
