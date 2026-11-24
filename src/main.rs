@@ -13,8 +13,10 @@ use std::{
 
 mod markdown;
 mod mmtext;
+mod toast;
 use markdown::MdCtx;
 use mmtext::Shaper;
+use toast::{Action, Kind, Toast};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -526,7 +528,10 @@ fn github_get(path: &str) -> Result<serde_json::Value, String> {
         .set("Accept", "application/vnd.github+json")
         .timeout(Duration::from_secs(12))
         .call()
-        .map_err(|e| e.to_string())?
+        .map_err(|e| match e {
+            ureq::Error::Transport(t) => format!("network: {t}"),
+            other => other.to_string(),
+        })?
         .into_json()
         .map_err(|e| e.to_string())
 }
@@ -649,6 +654,10 @@ struct InstallerApp {
     md_cache: HashMap<String, Tex>,
     md_wraps: HashMap<String, Rc<Vec<String>>>,
     md_parsed: HashMap<u64, Rc<Vec<markdown::Block>>>,
+    toasts: Vec<Toast>,
+    net_toast_shown: bool,
+    compiler_toast_done: bool,
+    installer_toast_done: bool,
     msgs: Vec<Tex>,
     check_tx: Sender<Check>,
     check_rx: Receiver<Check>,
@@ -687,6 +696,10 @@ impl InstallerApp {
             md_cache: HashMap::new(),
             md_wraps: HashMap::new(),
             md_parsed: HashMap::new(),
+            toasts: Vec::new(),
+            net_toast_shown: false,
+            compiler_toast_done: false,
+            installer_toast_done: false,
             msgs: MESSAGE_PNGS
                 .iter()
                 .enumerate()
@@ -700,6 +713,9 @@ impl InstallerApp {
             win_size: vec2(MENU_W, MENU_H),
         };
         app.check_installed(ctx);
+        // startup checks: connection + new akk / installer versions (shown as notification cards)
+        app.fetch_list(ctx, Target::Akkhara);
+        app.fetch_list(ctx, Target::Installer);
         app
     }
 
@@ -765,6 +781,44 @@ impl InstallerApp {
         match &self.installed {
             Some(Installed::Version(v)) if is_newer(tag, v) => "Update",
             _ => "Install",
+        }
+    }
+
+    /// Decide whether the startup checks found a newer akk compiler / installer.
+    fn check_update_toasts(&mut self) {
+        let mut new: Vec<Kind> = Vec::new();
+        if !self.compiler_toast_done {
+            match (&self.installed, &self.lists[Target::Akkhara.idx()]) {
+                (Some(inst), Load::Done(list)) => {
+                    if let Installed::Version(v) = inst {
+                        if let Some(r) = list.iter().find(|r| r.latest) {
+                            if is_newer(&r.tag, v) {
+                                new.push(Kind::Compiler(r.tag.clone()));
+                            }
+                        }
+                    }
+                    self.compiler_toast_done = true;
+                }
+                (Some(_), Load::Error) => self.compiler_toast_done = true,
+                _ => {}
+            }
+        }
+        if !self.installer_toast_done {
+            match &self.lists[Target::Installer.idx()] {
+                Load::Done(list) => {
+                    if let Some(r) = list.iter().find(|r| r.latest) {
+                        if is_newer(&r.tag, INSTALLER_VERSION) {
+                            new.push(Kind::Installer(r.tag.clone()));
+                        }
+                    }
+                    self.installer_toast_done = true;
+                }
+                Load::Error => self.installer_toast_done = true,
+                _ => {}
+            }
+        }
+        for k in new {
+            self.toasts.push(Toast::new(k));
         }
     }
 
@@ -1149,7 +1203,13 @@ impl eframe::App for InstallerApp {
                 Check::List(t, r) => {
                     self.lists[t.idx()] = match r {
                         Ok(v) => Load::Done(v),
-                        Err(_) => Load::Error,
+                        Err(e) => {
+                            if e.starts_with("network:") && !self.net_toast_shown {
+                                self.net_toast_shown = true;
+                                self.toasts.push(Toast::new(Kind::Network));
+                            }
+                            Load::Error
+                        }
                     };
                 }
                 Check::Detail(t, tag, r) => {
@@ -1168,6 +1228,8 @@ impl eframe::App for InstallerApp {
                 }
             }
         }
+
+        self.check_update_toasts();
 
         // ---- messages from the install worker thread
         if let Some(rx) = &self.rx {
@@ -1518,6 +1580,40 @@ impl eframe::App for InstallerApp {
                                 self.check_installed(ctx);
                             }
                         }
+                    }
+                }
+
+                // ---- notification cards (bottom-right)
+                if !self.toasts.is_empty() {
+                    let dt = ctx.input(|i| i.unstable_dt).min(0.05);
+                    let mut md = MdCtx {
+                        shaper: self.shaper.as_ref(),
+                        cache: &mut self.md_cache,
+                        wraps: &mut self.md_wraps,
+                        parsed: &mut self.md_parsed,
+                        ctx,
+                    };
+                    let act = toast::show(ui, &p, full, &mut self.toasts, &mut md, dt);
+                    ctx.request_repaint();
+                    let browsing = matches!(self.page, Page::Menu | Page::List | Page::Open | Page::Detail);
+                    match act {
+                        Some(Action::Retry) => {
+                            self.net_toast_shown = false;
+                            self.compiler_toast_done = false;
+                            self.installer_toast_done = false;
+                            self.check_installed(ctx);
+                            self.fetch_list(ctx, Target::Akkhara);
+                            self.fetch_list(ctx, Target::Installer);
+                        }
+                        Some(Action::Open(Kind::Compiler(tag))) if browsing => {
+                            self.target = Target::Akkhara;
+                            self.open_release(ctx, tag);
+                        }
+                        Some(Action::Open(Kind::Installer(tag))) if browsing => {
+                            self.target = Target::Installer;
+                            self.open_release(ctx, tag);
+                        }
+                        _ => {}
                     }
                 }
             });
