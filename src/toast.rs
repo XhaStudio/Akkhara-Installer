@@ -28,6 +28,7 @@ pub enum Kind {
     Network,
     Compiler(String),  // new akk release tag
     Installer(String), // new installer release tag
+    Installed(String), // this exact version is already installed
 }
 
 pub enum Action {
@@ -47,7 +48,10 @@ pub struct Toast {
 impl Toast {
     pub fn new(kind: Kind) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let total = if matches!(kind, Kind::Network) { 6.0 } else { 8.0 };
+        let total = match kind {
+            Kind::Network | Kind::Installed(_) => 6.0,
+            _ => 8.0,
+        };
         Self {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
             kind,
@@ -56,6 +60,17 @@ impl Toast {
             total,
             closing: None,
         }
+    }
+}
+
+impl Toast {
+    /// Is this a still-open card of the given kind?
+    pub fn is(&self, kind: &Kind) -> bool {
+        self.closing.is_none() && self.kind == *kind
+    }
+
+    pub fn restart(&mut self) {
+        self.left = self.total;
     }
 }
 
@@ -129,19 +144,25 @@ fn x_mark(p: &egui::Painter, c: egui::Pos2, col: Color32) {
     p.line_segment([c + vec2(-6.0, 6.0), c + vec2(6.0, -6.0)], Stroke::new(4.5_f32, col));
 }
 
-fn update_text(kind: &Kind) -> (&'static str, &'static str, String) {
+/// (title, Burmese body, version tag) of the cards that have a bell badge.
+fn update_text(kind: &Kind) -> (&'static str, String, String) {
     match kind {
         Kind::Compiler(tag) => (
             "New compiler version",
-            "akk compiler ဗားရှင်းအသစ်တစ်ခု ရရှိနိုင်ပါပြီ။ နောက်ဆုံးပေါ် အင်္ဂါရပ်များနှင့် တိုးတက်မှုများကို ခံစားနိုင်ရန် ယခုပဲ အပ်ဒိတ်လုပ်ပါ။",
+            "akk compiler ဗားရှင်းအသစ်တစ်ခု ရရှိနိုင်ပါပြီ။ နောက်ဆုံးပေါ် အင်္ဂါရပ်များနှင့် တိုးတက်မှုများကို ခံစားနိုင်ရန် ယခုပဲ အပ်ဒိတ်လုပ်ပါ။".to_string(),
             tag.clone(),
         ),
         Kind::Installer(tag) => (
             "New installer version",
-            "Akkhara Installer ဗားရှင်းအသစ်တစ်ခု ရရှိနိုင်ပါပြီ။ ပိုမိုကောင်းမွန်သော installer ကို အသုံးပြုနိုင်ရန် ယခုပဲ အပ်ဒိတ်လုပ်ပါ။",
+            "Akkhara Installer ဗားရှင်းအသစ်တစ်ခု ရရှိနိုင်ပါပြီ။ ပိုမိုကောင်းမွန်သော installer ကို အသုံးပြုနိုင်ရန် ယခုပဲ အပ်ဒိတ်လုပ်ပါ။".to_string(),
             tag.clone(),
         ),
-        Kind::Network => ("", "", String::new()),
+        Kind::Installed(tag) => (
+            "Already installed",
+            format!("ဤ version သည် install ပြီးသားဖြစ်သဖြင့် {tag} ကို install ရန် မလိုအပ်ပါ။"),
+            tag.clone(),
+        ),
+        Kind::Network => ("", String::new(), String::new()),
     }
 }
 
@@ -167,7 +188,7 @@ pub fn show(
             None
         } else {
             let (_, body, _) = update_text(&t.kind);
-            Some(mm_lines(md, body, BODY_PX, W - 32.0))
+            Some(mm_lines(md, &body, BODY_PX, W - 32.0))
         };
         let line_h = BODY_PX * 1.7 + 4.0;
         let h = match &lines {
@@ -249,10 +270,11 @@ pub fn show(
             t.closing = Some(0.0);
         } else if clicked_body {
             t.closing = Some(0.0);
-            action = Some(match &t.kind {
-                Kind::Network => Action::Retry,
-                other => Action::Open(other.clone()),
-            });
+            action = match &t.kind {
+                Kind::Network => Some(Action::Retry),
+                Kind::Installed(_) => None, // just a notice: clicking only closes it
+                other => Some(Action::Open(other.clone())),
+            };
         }
     }
     toasts.retain(|t| t.closing.map_or(true, |c| c < SLIDE_OUT));
